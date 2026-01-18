@@ -49,7 +49,7 @@ python3 local_telegram_bot.py
 
 Для включения задайте в `.env`:
 - `GEMINI_API_KEY`
- - `GEMINI_MODEL` (по умолчанию `gemini-3-pro-preview`)
+- `GEMINI_MODEL` (по умолчанию `gemini-1.5-flash`)
 Можно также задать системный промпт для итоговой обработки:
 - `GEMINI_SYSTEM_PROMPT`
 

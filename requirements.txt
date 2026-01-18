@@ -1,0 +1,5 @@
+python-telegram-bot>=21.0,<22
+python-dotenv>=1.0,<2
+faster-whisper>=1.0,<2
+numpy<2
+gigaam>=0.1.0

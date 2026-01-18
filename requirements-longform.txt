@@ -1,0 +1,4 @@
+# Optional extras for GigaAM long-form mode (VAD via pyannote.audio).
+# Requires `HF_TOKEN` with access to `pyannote/voice-activity-detection`.
+gigaam[longform]==0.1.0
+requests>=2.0,<3

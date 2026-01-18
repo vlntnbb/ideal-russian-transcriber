@@ -1,4 +1,4 @@
-# Ideal Russian Transcribe — локальный Telegram ASR бот
+# Ideal Russian Transcriber — локальный Telegram ASR бот
 
 В этом репозитории есть:
 - `dual_transcriber_gui.py` — GUI для Whisper + GigaAM

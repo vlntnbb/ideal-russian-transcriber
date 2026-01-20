@@ -19,6 +19,7 @@ import smtplib
 import ssl
 import subprocess
 import threading
+import multiprocessing
 from email.message import EmailMessage
 from typing import Optional
 
@@ -30,10 +31,12 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 import httpx
 
 from snapscript.core.audio_processor import (
+    ASRSegment,
     AudioProcessor,
     GigaAMTranscriptionService,
     TranscriptionCancelled,
     TranscriptionService,
+    gigaam_transcribe_worker,
 )
 from snapscript.utils.logging_utils import setup_logging
 
@@ -666,6 +669,79 @@ def _active_sessions_summary_line(context: ContextTypes.DEFAULT_TYPE) -> str:
     # Genitive after "от":
     user_word = _ru_plural(users, "пользователя", "пользователей", "пользователей")
     return f"В процессе обработки {files} {file_word} от {users} {user_word}."
+
+
+async def _gigaam_transcribe_hard_cancel(
+    *,
+    wav_path: str,
+    model_name: str,
+    device: str,
+    hf_token: Optional[str],
+    cancel_event: asyncio.Event,
+) -> tuple[list, dict]:
+    """
+    Runs GigaAM in a separate process and terminates it if cancel_event is set.
+    Returns (segments, info) where segments is a list of ASRSegment-like tuples.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    q = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=gigaam_transcribe_worker,
+        kwargs={
+            "wav_path": wav_path,
+            "model_name": model_name,
+            "device": device,
+            "hf_token": hf_token,
+            "out_queue": q,
+        },
+        daemon=True,
+    )
+    proc.start()
+
+    async def _wait_result():
+        return await asyncio.to_thread(q.get)
+
+    wait_task = asyncio.create_task(_wait_result())
+    cancel_task = asyncio.create_task(cancel_event.wait())
+    try:
+        done, pending = await asyncio.wait({wait_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+        if cancel_task in done:
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+            except Exception:
+                pass
+            try:
+                await asyncio.to_thread(proc.join, 2.0)
+            except Exception:
+                pass
+            raise _UserCancelled()
+
+        payload = wait_task.result()
+        try:
+            await asyncio.to_thread(proc.join, 2.0)
+        except Exception:
+            pass
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("GigaAM worker returned invalid payload.")
+        if not payload.get("ok"):
+            err_type = str(payload.get("error_type") or "GigaAMError")
+            err = str(payload.get("error") or "").strip() or err_type
+            raise RuntimeError(err)
+
+        segs = payload.get("segments") or []
+        info = payload.get("info") or {}
+        return segs, info
+    finally:
+        for t in (wait_task, cancel_task):
+            if not t.done():
+                t.cancel()
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:
+            pass
 
 
 async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2067,7 +2143,22 @@ async def _process_audio(
                     )
                 try:
                     g0 = time.monotonic()
-                    g_segments, _g_info = await loop.run_in_executor(None, lambda: giga.transcribe(wav_path))
+                    hard_cancel = _truthy_env("GIGAAM_HARD_CANCEL", True)
+                    if hard_cancel:
+                        try:
+                            logging.getLogger("local_telegram_bot").info("GigaAM hard-cancel: enabled (subprocess)")
+                        except Exception:
+                            pass
+                        seg_tuples, _g_info = await _gigaam_transcribe_hard_cancel(
+                            wav_path=wav_path,
+                            model_name=gigaam_model,
+                            device=device,
+                            hf_token=hf_token,
+                            cancel_event=cancel_event,
+                        )
+                        g_segments = [ASRSegment(start=a, end=b, text=t) for (a, b, t) in (seg_tuples or [])]
+                    else:
+                        g_segments, _g_info = await loop.run_in_executor(None, lambda: giga.transcribe(wav_path))
                     g_wall = time.monotonic() - g0
                     if giga_state and giga_state.audio_sec > 0:
                         _update_rtf_est("gigaam", g_wall / giga_state.audio_sec)

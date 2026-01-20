@@ -485,3 +485,35 @@ class GigaAMTranscriptionService:
             "chunking": True,
             "chunk_sec": chunk_sec,
         }
+
+
+def gigaam_transcribe_worker(
+    *,
+    wav_path: str,
+    model_name: str,
+    device: str,
+    hf_token: Optional[str],
+    out_queue,
+) -> None:
+    """
+    Helper for running GigaAM transcription in a separate process.
+    `out_queue` should be a multiprocessing.Queue-like object.
+    """
+    try:
+        svc = GigaAMTranscriptionService(model_name=model_name, device=device, hf_token=hf_token)
+        segments, info = svc.transcribe(wav_path)
+        out_queue.put(
+            {
+                "ok": True,
+                "segments": [(float(s.start), float(s.end), str(s.text)) for s in (segments or [])],
+                "info": info or {},
+            }
+        )
+    except Exception as exc:
+        out_queue.put(
+            {
+                "ok": False,
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+            }
+        )

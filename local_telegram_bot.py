@@ -371,6 +371,35 @@ def _telegram_max_get_file_bytes() -> int:
     return mb * 1024 * 1024
 
 
+def _file_too_big_message(*, size_mb: float, limit_mb: float) -> str:
+    """
+    User-facing guidance for speech audio compression.
+    """
+    size_mb = max(0.0, float(size_mb))
+    limit_mb = max(0.0, float(limit_mb)) or 20.0
+
+    # Rough estimates: MB/min ≈ (kbps * 60) / 8 / 1024
+    mp3_kbps = 48
+    ogg_kbps = 24
+    mp3_mb_per_min = (mp3_kbps * 60) / 8 / 1024
+    ogg_mb_per_min = (ogg_kbps * 60) / 8 / 1024
+    mp3_max_min = int(limit_mb / mp3_mb_per_min) if mp3_mb_per_min > 0 else 0
+    ogg_max_min = int(limit_mb / ogg_mb_per_min) if ogg_mb_per_min > 0 else 0
+
+    return (
+        f"Ошибка: файл слишком большой для скачивания ботом через Telegram API "
+        f"({size_mb:.1f}MB, лимит ~{limit_mb:.0f}MB). "
+        f"Сожмите файл, чтобы он удовлетворял этому ограничению и отправьте снова.\n\n"
+        f"Как сжать голос (ffmpeg):\n"
+        f"1) MP3 (хорошее качество речи):\n"
+        f"   ffmpeg -i input.mp3 -vn -ac 1 -ar 24000 -b:a {mp3_kbps}k output.mp3\n"
+        f"   ~{mp3_mb_per_min:.2f}MB/мин (≈ до {mp3_max_min} мин в {limit_mb:.0f}MB)\n"
+        f"2) OGG/Opus (обычно меньше, подходит для voice):\n"
+        f"   ffmpeg -i input.mp3 -vn -c:a libopus -application voip -vbr on -ac 1 -b:a {ogg_kbps}k output.ogg\n"
+        f"   ~{ogg_mb_per_min:.2f}MB/мин (≈ до {ogg_max_min} мин в {limit_mb:.0f}MB)\n"
+    )
+
+
 async def _send_transcript_file(update: Update, *, whisper_text: str, gigaam_text: str) -> None:
     msg = update.effective_message
     if msg is None:
@@ -1037,11 +1066,7 @@ async def _process_audio(
                 session["status"] = "error"
                 session["error"] = f"incoming_file_too_big({size_mb:.1f}MB>{limit_mb:.0f}MB)"
                 await _safe_delete(progress)
-                await reply_target.reply_text(
-                    f"Ошибка: файл слишком большой для скачивания ботом через Telegram API "
-                    f"({size_mb:.1f}MB, лимит ~{limit_mb:.0f}MB). "
-                    f"Сожмите файл, чтобы он удовлетворял этому ограничению и отправьте снова."
-                )
+                await reply_target.reply_text(_file_too_big_message(size_mb=size_mb, limit_mb=limit_mb))
                 return
 
             try:
@@ -1054,11 +1079,7 @@ async def _process_audio(
                     session["status"] = "error"
                     session["error"] = "telegram_get_file_too_big"
                     await _safe_delete(progress)
-                    await reply_target.reply_text(
-                        f"Ошибка: файл слишком большой для скачивания ботом через Telegram API "
-                        f"({size_mb:.1f}MB, лимит ~{limit_mb:.0f}MB). "
-                        f"Сожмите файл, чтобы он удовлетворял этому ограничению и отправьте снова."
-                    )
+                    await reply_target.reply_text(_file_too_big_message(size_mb=size_mb, limit_mb=limit_mb))
                     return
                 raise
 

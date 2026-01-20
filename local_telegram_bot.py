@@ -14,6 +14,11 @@ import warnings
 import uuid
 import html as _html
 import re
+import secrets
+import smtplib
+import ssl
+import subprocess
+from email.message import EmailMessage
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -46,6 +51,17 @@ TELEGRAM_TEXT_LIMIT = 4096
 STATS_PATH = os.path.join(os.path.dirname(__file__), "asr_stats.json")
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_USAGE_LOG_PATH = os.path.join(os.path.dirname(__file__), "usage_sessions.jsonl")
+AUTH_STATE_PATH = os.path.join(os.path.dirname(__file__), "auth_state.json")
+
+# Email auth: only this domain can authorize users for Gemini access.
+DEFAULT_AUTH_DOMAIN = "bbooster.io"
+DEFAULT_AUTH_CODE_TTL_SEC = 15 * 60  # 15 minutes
+DEFAULT_AUTH_CODE_MIN_WORDS = 6
+DEFAULT_AUTH_CODE_MAX_WORDS = 10
+
+# Open-source fallback model (Ollama).
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_MODEL = "deepseek-r1:8b"
 
 _USAGE_LOGGER: Optional[logging.Logger] = None
 
@@ -80,6 +96,306 @@ def _truthy_env(name: str, default: bool = True) -> bool:
     if not raw:
         return default
     return raw not in {"0", "false", "no", "off", "disabled"}
+
+
+_SPELL_WORDS = [
+    # Harry Potter-ish (latin-ish) "spell" words, good for manual typing.
+    "accio",
+    "alohomora",
+    "avada",
+    "kedavra",
+    "crucio",
+    "imperio",
+    "expelliarmus",
+    "stupefy",
+    "protego",
+    "lumos",
+    "nox",
+    "expecto",
+    "patronum",
+    "reducto",
+    "sectumsempra",
+    "obliviate",
+    "wingardium",
+    "leviosa",
+    "riddikulus",
+    "muffliato",
+    "finite",
+    "incantatem",
+    "petrificus",
+    "totalus",
+    "confundo",
+    "diffindo",
+    "aguamenti",
+    "avis",
+    "duro",
+    "glacius",
+    "silencio",
+    "sonorus",
+    "quietus",
+    "locomotor",
+    "morsmordre",
+    "reparo",
+    "scourgify",
+    "tarantallegra",
+    "episkey",
+    "priori",
+    "incarcerous",
+    "liberacorpus",
+    "legilimens",
+    "occlumens",
+    "verdimillious",
+    "periculum",
+    "portus",
+    "dissendium",
+    "serpensortia",
+]
+
+_AUTH_LOCK = threading.Lock()
+_AUTH_STATE: Optional[dict] = None
+
+
+def _auth_enabled() -> bool:
+    return _truthy_env("AUTH_ENABLED", False)
+
+
+def _auth_domain() -> str:
+    return (os.environ.get("AUTH_DOMAIN") or DEFAULT_AUTH_DOMAIN).strip().lower()
+
+
+def _auth_code_ttl_sec() -> int:
+    raw = (os.environ.get("AUTH_CODE_TTL_SEC") or "").strip()
+    if raw.isdigit():
+        return max(60, int(raw))
+    raw_min = (os.environ.get("AUTH_CODE_TTL_MIN") or "").strip()
+    if raw_min.isdigit():
+        return max(1, int(raw_min)) * 60
+    return DEFAULT_AUTH_CODE_TTL_SEC
+
+
+def _auth_code_word_count() -> tuple[int, int]:
+    def _int(name: str, default: int) -> int:
+        raw = (os.environ.get(name) or "").strip()
+        return int(raw) if raw.isdigit() else default
+
+    mn = _int("AUTH_CODE_MIN_WORDS", DEFAULT_AUTH_CODE_MIN_WORDS)
+    mx = _int("AUTH_CODE_MAX_WORDS", DEFAULT_AUTH_CODE_MAX_WORDS)
+    mn = max(3, mn)
+    mx = max(mn, mx)
+    return mn, mx
+
+
+def _auth_state_default() -> dict:
+    return {
+        "authorized_users": {},  # user_id(str) -> {"email": str, "authorized_at": iso}
+        "whitelisted_chats": {},  # chat_id(str) -> {"added_by": user_id, "added_at": iso}
+        "pending": {},  # user_id(str) -> {"email": str, "code": str, "expires_at": iso, "attempts": int}
+        "prompted_users": {},  # user_id(str) -> iso
+    }
+
+
+def _load_auth_state() -> dict:
+    global _AUTH_STATE
+    if _AUTH_STATE is not None:
+        return _AUTH_STATE
+    with _AUTH_LOCK:
+        if _AUTH_STATE is not None:
+            return _AUTH_STATE
+        state = _auth_state_default()
+        try:
+            if os.path.exists(AUTH_STATE_PATH):
+                with open(AUTH_STATE_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+                if isinstance(data, dict):
+                    state.update({k: v for k, v in data.items() if k in state and isinstance(v, dict)})
+        except Exception:
+            logging.getLogger("local_telegram_bot").exception("Failed to load auth state")
+        _AUTH_STATE = state
+        return state
+
+
+def _save_auth_state(state: dict) -> None:
+    try:
+        tmp = AUTH_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, AUTH_STATE_PATH)
+    except Exception:
+        logging.getLogger("local_telegram_bot").exception("Failed to save auth state")
+
+
+def _now_utc_iso() -> str:
+    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+
+
+def _normalize_code(text: str) -> str:
+    s = (text or "").strip().lower()
+    # Keep letters/numbers and collapse everything else to spaces.
+    s = re.sub(r"[^a-z0-9а-яё]+", " ", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"\\s+", " ", s).strip()
+    return s
+
+
+def _make_spell_code() -> str:
+    rng = secrets.SystemRandom()
+    mn, mx = _auth_code_word_count()
+    n = rng.randint(mn, mx)
+    if len(_SPELL_WORDS) >= n:
+        words = rng.sample(_SPELL_WORDS, k=n)
+    else:
+        words = [rng.choice(_SPELL_WORDS) for _ in range(n)]
+    rng.shuffle(words)
+    return " ".join(words)
+
+
+def _auth_is_user_authorized(user_id: int) -> bool:
+    st = _load_auth_state()
+    return str(int(user_id)) in (st.get("authorized_users") or {})
+
+
+def _auth_is_chat_whitelisted(chat_id: int) -> bool:
+    st = _load_auth_state()
+    return str(int(chat_id)) in (st.get("whitelisted_chats") or {})
+
+
+def _auth_can_use_gemini(user_id: int, chat_id: int) -> bool:
+    if not _auth_enabled():
+        return True
+    return _auth_is_user_authorized(user_id) or _auth_is_chat_whitelisted(chat_id)
+
+
+def _auth_maybe_whitelist_chat(*, user_id: int, chat_id: int) -> bool:
+    """
+    If user is authorized and chat isn't whitelisted yet, add it.
+    Returns True when chat was newly added.
+    """
+    if not _auth_enabled():
+        return False
+    if not _auth_is_user_authorized(user_id):
+        return False
+    if _auth_is_chat_whitelisted(chat_id):
+        return False
+    with _AUTH_LOCK:
+        st = _load_auth_state()
+        if str(int(chat_id)) in st["whitelisted_chats"]:
+            return False
+        st["whitelisted_chats"][str(int(chat_id))] = {"added_by": int(user_id), "added_at": _now_utc_iso()}
+        _save_auth_state(st)
+        return True
+
+
+def _auth_should_prompt_user(user_id: int) -> bool:
+    if not _auth_enabled():
+        return False
+    st = _load_auth_state()
+    return str(int(user_id)) not in (st.get("prompted_users") or {})
+
+
+def _auth_mark_prompted(user_id: int) -> None:
+    with _AUTH_LOCK:
+        st = _load_auth_state()
+        st["prompted_users"][str(int(user_id))] = _now_utc_iso()
+        _save_auth_state(st)
+
+
+def _auth_start_pending(user_id: int, email: str) -> str:
+    code = _make_spell_code()
+    ttl = _auth_code_ttl_sec()
+    expires = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc) + datetime.timedelta(seconds=ttl)
+    with _AUTH_LOCK:
+        st = _load_auth_state()
+        st["pending"][str(int(user_id))] = {
+            "email": email,
+            "code": code,
+            "expires_at": expires.isoformat(),
+            "attempts": 0,
+        }
+        _save_auth_state(st)
+    return code
+
+
+def _auth_has_pending(user_id: int) -> bool:
+    st = _load_auth_state()
+    return str(int(user_id)) in (st.get("pending") or {})
+
+
+def _auth_verify_code(user_id: int, text: str) -> tuple[bool, str]:
+    """
+    Returns (ok, message). On success also persists the authorization.
+    """
+    domain = _auth_domain()
+    uid = str(int(user_id))
+    norm = _normalize_code(text)
+    with _AUTH_LOCK:
+        st = _load_auth_state()
+        pending = (st.get("pending") or {}).get(uid)
+        if not pending:
+            return False, f"Нет активного кода. Отправьте `/auth <email@{domain}>`."
+
+        expires_at = (pending.get("expires_at") or "").strip()
+        try:
+            exp = datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except Exception:
+            exp = None
+        if not exp or exp <= datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc):
+            st["pending"].pop(uid, None)
+            _save_auth_state(st)
+            return False, f"Код истёк. Отправьте `/auth <email@{domain}>` ещё раз."
+
+        expected = _normalize_code(pending.get("code") or "")
+        if norm != expected:
+            pending["attempts"] = int(pending.get("attempts") or 0) + 1
+            if pending["attempts"] >= 5:
+                st["pending"].pop(uid, None)
+                _save_auth_state(st)
+                return False, f"Слишком много попыток. Отправьте `/auth <email@{domain}>` ещё раз."
+            _save_auth_state(st)
+            return False, "Код не совпал. Проверьте слова и порядок (как в письме) и попробуйте ещё раз."
+
+        email = (pending.get("email") or "").strip().lower()
+        st["pending"].pop(uid, None)
+        st["authorized_users"][uid] = {"email": email, "authorized_at": _now_utc_iso()}
+        _save_auth_state(st)
+        return True, "✅ Авторизация успешна. Теперь доступна обработка через Gemini."
+
+
+def _smtp_send_email(*, to_email: str, subject: str, body: str) -> None:
+    host = (os.environ.get("SMTP_HOST") or "").strip()
+    if not host:
+        raise RuntimeError("SMTP_HOST не задан")
+    port = int((os.environ.get("SMTP_PORT") or "").strip() or "587")
+    username = (os.environ.get("SMTP_USERNAME") or "").strip()
+    password = (os.environ.get("SMTP_PASSWORD") or "").strip()
+    from_email = (os.environ.get("SMTP_FROM") or "").strip() or username
+    if not from_email:
+        raise RuntimeError("SMTP_FROM не задан (и SMTP_USERNAME пуст)")
+
+    use_ssl = _truthy_env("SMTP_SSL", False)
+    starttls = _truthy_env("SMTP_STARTTLS", True)
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    if use_ssl:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=20) as s:
+            if username and password:
+                s.login(username, password)
+            s.send_message(msg)
+        return
+
+    with smtplib.SMTP(host, port, timeout=20) as s:
+        s.ehlo()
+        if starttls:
+            context = ssl.create_default_context()
+            s.starttls(context=context)
+            s.ehlo()
+        if username and password:
+            s.login(username, password)
+        s.send_message(msg)
 
 
 def _setup_usage_logger() -> Optional[logging.Logger]:
@@ -306,9 +622,16 @@ def _get_env(name: str, default: str) -> str:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ = context
+    domain = _auth_domain()
+    auth_line = (
+        f"Для доступа к Gemini (только домен {domain}): /auth <email@{domain}>"
+        if _auth_enabled()
+        else "Авторизация Gemini отключена (AUTH_ENABLED=0)."
+    )
     await update.effective_message.reply_text(
         "Отправьте voice/audio — верну транскрипцию двумя моделями: Whisper и GigaAM.\n"
-        "Команды: /models, /process (или напишите: `обработать <промпт>`)"
+        "Команды: /models, /process (или напишите: `обработать <промпт>`)\n\n"
+        f"{auth_line}"
     )
 
 
@@ -337,6 +660,64 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"GEMINI_MEDIA_RESOLUTION={gemini_media_res}\n"
         f"GEMINI_THINKING_LEVEL={gemini_thinking}"
     )
+
+
+async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
+        return
+
+    user_id = int(user.id)
+    if _auth_is_user_authorized(user_id):
+        await msg.reply_text("✅ Вы уже авторизованы.")
+        return
+
+    if not _auth_enabled():
+        await msg.reply_text("Авторизация отключена (AUTH_ENABLED=0). Ничего делать не нужно.")
+        return
+
+    domain = _auth_domain()
+    email = (" ".join(context.args or [])).strip()
+    if not email:
+        await msg.reply_text(f"Использование: /auth <email@{domain}>")
+        return
+
+    email = email.strip().lower()
+    # Minimal email validation (enough for domain-gated auth).
+    # NOTE: must use `\s` (whitespace), not `\\s` (literal "s" + backslash in a char-class).
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        await msg.reply_text(f"Неверный email. Пример: name@{domain}")
+        return
+    if not email.endswith(f"@{domain}"):
+        await msg.reply_text(f"Авторизация доступна только для домена {domain}.")
+        return
+
+    code = _auth_start_pending(user_id, email)
+    ttl_min = max(1, int(_auth_code_ttl_sec() / 60))
+
+    subject = "Ideal Russian Transcriber — код авторизации"
+    body = (
+        "Чтобы авторизоваться в боте, отправьте в Telegram следующую фразу (слова и порядок важны):\n\n"
+        f"{code}\n\n"
+        f"Код действителен {ttl_min} минут."
+    )
+
+    await msg.reply_text(f"📧 Отправляю код на {email}…")
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, lambda: _smtp_send_email(to_email=email, subject=subject, body=body))
+    except Exception as exc:
+        logging.getLogger("local_telegram_bot").exception("Failed to send auth email")
+        await msg.reply_text(
+            "Не удалось отправить письмо. Проверьте SMTP настройки в `.env` "
+            "(SMTP_HOST/SMTP_PORT/SMTP_USERNAME/SMTP_PASSWORD/SMTP_FROM).\n"
+            f"Ошибка: {exc}"
+        )
+        return
+
+    mn, mx = _auth_code_word_count()
+    await msg.reply_text(f"✅ Письмо отправлено на {email}.\nПришлите сюда код из {mn}-{mx} слов (как в письме).")
 
 
 def _pick_telegram_file(update: Update):
@@ -424,8 +805,9 @@ async def _send_transcript_file(update: Update, *, whisper_text: str, gigaam_tex
 async def _send_markdown_file(
     update: Update,
     *,
-    gemini_text: str,
-    gemini_error: str,
+    final_text: str,
+    final_error: str,
+    final_label: str,
     whisper_text: str,
     gigaam_text: str,
 ) -> None:
@@ -437,21 +819,21 @@ async def _send_markdown_file(
     chat_id = update.effective_chat.id if update.effective_chat else "chat"
     filename = f"transcript_{chat_id}_{now}.md"
 
-    if gemini_error and not gemini_text:
-        gemini_block = (
+    if final_error and not final_text:
+        final_block = (
             "### Итоговый текст:\n\n"
-            "_(Gemini не смог сформировать итог)_\n\n"
+            f"_({final_label} не смог сформировать итог)_\n\n"
             "### Примечания для контент-менеджера:\n\n"
             "_(нет)_\n\n"
             "### Отчет о проделанных действиях:\n\n"
-            f"- Ошибка Gemini: `{gemini_error.strip()}`\n"
+            f"- Ошибка: `{final_error.strip()}`\n"
         )
     else:
-        gemini_block = (gemini_text or "").strip()
+        final_block = (final_text or "").strip()
 
     content = (
-        "## 1) Итоговый вариант по шаблону (Gemini)\n\n"
-        f"{gemini_block}\n\n"
+        f"## 1) Итоговый вариант по шаблону ({final_label})\n\n"
+        f"{final_block}\n\n"
         "---\n\n"
         "## 2) Вариант Whisper\n\n"
         f"{(whisper_text or '').strip()}\n\n"
@@ -812,6 +1194,295 @@ async def _gemini_stream_generate(
     return out
 
 
+def _ollama_base_url() -> str:
+    return (os.environ.get("OLLAMA_BASE_URL") or DEFAULT_OLLAMA_BASE_URL).strip().rstrip("/")
+
+
+def _ollama_pick_best_local_model() -> str:
+    """
+    Best-effort: choose the most capable *locally available* Ollama model.
+    Prefers larger models and skips embedding-only / remote models.
+    """
+    base_url = _ollama_base_url()
+    try:
+        r = httpx.get(f"{base_url}/api/tags", timeout=10.0)
+        r.raise_for_status()
+        data = r.json() or {}
+    except Exception:
+        return ""
+
+    models = data.get("models") or []
+    if not isinstance(models, list):
+        return ""
+
+    def is_embedding(name: str) -> bool:
+        n = (name or "").lower()
+        return any(
+            t in n
+            for t in (
+                "embedding",
+                "embed",
+                "text-embedding",
+                "nomic-embed",
+                "mxbai-embed",
+                "bge-",
+            )
+        )
+
+    candidates = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        # Exclude cloud/remote entries: user asked for local only.
+        if (m.get("remote_host") or "").strip():
+            continue
+        name = (m.get("name") or m.get("model") or "").strip()
+        if not name:
+            continue
+        if is_embedding(name):
+            continue
+        size = int(m.get("size") or 0)
+        candidates.append((size, name))
+
+    if not candidates:
+        # Fallback: any local model.
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            if (m.get("remote_host") or "").strip():
+                continue
+            name = (m.get("name") or m.get("model") or "").strip()
+            if not name:
+                continue
+            size = int(m.get("size") or 0)
+            candidates.append((size, name))
+
+    if not candidates:
+        return ""
+    candidates.sort()
+    return candidates[-1][1]
+
+
+def _ollama_model() -> str:
+    raw = (os.environ.get("OLLAMA_MODEL") or "").strip()
+    if not raw or raw.lower() == "auto":
+        picked = _ollama_pick_best_local_model()
+        return picked or DEFAULT_OLLAMA_MODEL
+    return raw
+
+
+def _ollama_options_from_env() -> dict:
+    # Keep defaults conservative and suitable for "thinking" models.
+    # Users can tune via env vars if needed.
+    #
+    # Note: On macOS Ollama often uses Metal (GPU) by default, so CPU usage may stay low.
+    # These knobs mainly help saturate CPU for CPU-bound configs and/or improve throughput.
+    def _f(name: str, default: float) -> float:
+        raw = (os.environ.get(name) or "").strip()
+        try:
+            return float(raw) if raw else default
+        except Exception:
+            return default
+
+    def _i(name: str, default: int) -> int:
+        raw = (os.environ.get(name) or "").strip()
+        try:
+            return int(raw) if raw else default
+        except Exception:
+            return default
+
+    def _ram_gb() -> Optional[float]:
+        # Best-effort cross-platform physical RAM detection.
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            pages = os.sysconf("SC_PHYS_PAGES")
+            if page_size and pages:
+                return (float(page_size) * float(pages)) / (1024**3)
+        except Exception:
+            return None
+        return None
+
+    perf = (os.environ.get("OLLAMA_PERF_PROFILE") or "auto").strip().lower()
+    cpu_count = int(os.cpu_count() or 0)
+    ram_gb = _ram_gb()
+
+    options = {
+        "temperature": _f("OLLAMA_TEMPERATURE", 0.7),
+        "top_p": _f("OLLAMA_TOP_P", 0.95),
+        "num_ctx": _i("OLLAMA_NUM_CTX", 8192),
+    }
+
+    # Explicit overrides (highest priority).
+    raw_threads = (os.environ.get("OLLAMA_NUM_THREADS") or os.environ.get("OLLAMA_NUM_THREAD") or "").strip()
+    raw_batch = (os.environ.get("OLLAMA_NUM_BATCH") or "").strip()
+    if raw_threads.isdigit():
+        options["num_thread"] = int(raw_threads)
+    if raw_batch.isdigit():
+        options["num_batch"] = int(raw_batch)
+
+    # Auto-tuning for stronger machines.
+    # Only apply when user didn't set explicit overrides.
+    if "num_thread" not in options:
+        if perf in {"max", "aggressive", "fast"}:
+            if cpu_count:
+                options["num_thread"] = max(4, cpu_count - 2)
+        elif perf == "auto":
+            if cpu_count >= 12 and (ram_gb is None or ram_gb >= 32):
+                options["num_thread"] = max(4, cpu_count - 2)
+
+    if "num_batch" not in options:
+        if perf in {"max", "aggressive", "fast"}:
+            # Higher batch can improve throughput on powerful machines.
+            options["num_batch"] = 512
+        elif perf == "auto":
+            if cpu_count >= 12 and (ram_gb is None or ram_gb >= 32):
+                options["num_batch"] = 256
+
+    return options
+
+
+_OLLAMA_PULL_LOCK = threading.Lock()
+
+
+def _ensure_ollama_model_present(model: str) -> None:
+    """
+    Best-effort: ensure the model exists locally.
+    If OLLAMA_AUTO_PULL=1, runs `ollama pull <model>` when missing.
+    """
+    base_url = _ollama_base_url()
+    try:
+        r = httpx.get(f"{base_url}/api/tags", timeout=10.0)
+        r.raise_for_status()
+        data = r.json() or {}
+        models = data.get("models") or []
+        if any((m or {}).get("name") == model for m in models):
+            return
+    except Exception:
+        # If Ollama isn't reachable, don't try to pull.
+        return
+
+    if not _truthy_env("OLLAMA_AUTO_PULL", True):
+        return
+
+    with _OLLAMA_PULL_LOCK:
+        # Double-check after waiting for the lock.
+        try:
+            r = httpx.get(f"{base_url}/api/tags", timeout=10.0)
+            r.raise_for_status()
+            data = r.json() or {}
+            models = data.get("models") or []
+            if any((m or {}).get("name") == model for m in models):
+                return
+        except Exception:
+            return
+        try:
+            subprocess.run(["ollama", "pull", model], check=False)
+        except Exception:
+            pass
+
+
+def _split_think_blocks(text: str) -> tuple[str, str]:
+    """
+    Splits a model output into (thoughts, final) using <think>...</think> blocks.
+    Handles the common DeepSeek-R1 style.
+    """
+    s = text or ""
+    thoughts = []
+    final_parts = []
+    idx = 0
+    while True:
+        start = s.find("<think>", idx)
+        if start == -1:
+            final_parts.append(s[idx:])
+            break
+        final_parts.append(s[idx:start])
+        end = s.find("</think>", start + len("<think>"))
+        if end == -1:
+            thoughts.append(s[start + len("<think>") :])
+            break
+        thoughts.append(s[start + len("<think>") : end])
+        idx = end + len("</think>")
+    return ("".join(thoughts).strip(), "".join(final_parts).strip())
+
+
+async def _ollama_stream_generate(
+    *,
+    model: str,
+    prompt: str,
+    system_prompt: Optional[str],
+    on_update,
+) -> str:
+    """
+    Streams Ollama `/api/chat`. Calls `on_update(thoughts, elapsed_sec)` periodically.
+    Returns final answer (tries to strip <think> blocks when present).
+    """
+    _ensure_ollama_model_present(model)
+    url = f"{_ollama_base_url()}/api/chat"
+    options = _ollama_options_from_env()
+    try:
+        logging.getLogger("local_telegram_bot").info(
+            "Ollama generate (model=%s perf=%s options=%s)",
+            model,
+            (os.environ.get("OLLAMA_PERF_PROFILE") or "auto").strip().lower(),
+            {k: options.get(k) for k in ("num_thread", "num_batch", "num_ctx", "temperature", "top_p") if k in options},
+        )
+    except Exception:
+        pass
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt or ""},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": True,
+        "options": options,
+    }
+
+    timeout = httpx.Timeout(connect=5.0, read=600.0, write=30.0, pool=30.0)
+    raw = ""
+    thoughts = ""
+    started = time.monotonic()
+    last_ui = 0.0
+    ui_interval = 3.0
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, json=payload) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except Exception:
+                    continue
+                msg = (chunk or {}).get("message") or {}
+                raw += str(msg.get("content") or "")
+                th, _final = _split_think_blocks(raw)
+                thoughts = th
+
+                now = time.monotonic()
+                if (now - last_ui) >= ui_interval:
+                    last_ui = now
+                    try:
+                        await on_update(thoughts, now - started)
+                    except Exception:
+                        pass
+
+                if (chunk or {}).get("done") is True:
+                    break
+
+    try:
+        await on_update(thoughts, time.monotonic() - started)
+    except Exception:
+        pass
+
+    _thoughts, final = _split_think_blocks(raw)
+    out = (final or raw).strip()
+    if not out:
+        raise RuntimeError("Local LLM не вернул финальный текст (пусто).")
+    return out
+
+
 async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if msg is None:
@@ -824,9 +1495,6 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if not api_key:
-        await msg.reply_text("Не задан `GEMINI_API_KEY` в `.env`.")
-        return
 
     model_override, user_prompt = _parse_process_args(" ".join(context.args or []))
     if not user_prompt:
@@ -843,7 +1511,22 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text("Нет сохранённой транскрипции. Сначала отправьте voice/audio.")
         return
 
-    model = (model_override or os.environ.get("GEMINI_MODEL") or "gemini-3-pro-preview").strip()
+    # If an authorized user uses /process in a group for the first time, whitelist this chat.
+    if _is_group_chat(update):
+        _auth_maybe_whitelist_chat(user_id=user_id, chat_id=chat_id)
+
+    can_use_gemini = _auth_can_use_gemini(user_id, chat_id)
+    if not can_use_gemini and _auth_should_prompt_user(user_id):
+        _auth_mark_prompted(user_id)
+        domain = _auth_domain()
+        await msg.reply_text(
+            f"ℹ️ Gemini доступен только после авторизации по домену {domain}.\n"
+            f"Чтобы авторизоваться, напишите: /auth <email@{domain}>\n\n"
+            "Пока что обработаю через локальную open-source модель."
+        )
+
+    provider = "gemini" if (can_use_gemini and api_key) else "ollama"
+    model = (model_override or os.environ.get("GEMINI_MODEL") or "gemini-3-pro-preview").strip() if provider == "gemini" else _ollama_model()
     generation_config = {
         # Match the UI defaults from your screenshot:
         "temperature": _parse_float_env(os.environ.get("GEMINI_TEMPERATURE") or "1", 1.0),
@@ -868,7 +1551,8 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     llm_sem: asyncio.Semaphore = context.application.bot_data.setdefault("llm_semaphore", asyncio.Semaphore(1))
     async with llm_sem:
-        status = await msg.reply_text(f"🧠 Gemini ({model}) — обрабатываю…")
+        label = ("Gemini" if provider == "gemini" else "Local") + f" ({model})"
+        status = await msg.reply_text(f"🧠 {label} — обрабатываю…")
         try:
             async def on_update(thoughts: str, elapsed_sec: float) -> None:
                 if not update.effective_chat:
@@ -877,7 +1561,7 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 body = _trim_for_telegram(thoughts or "(пока без мыслей)")
                 body_html = _markdown_bold_lines_to_html(body)
                 text_html = (
-                    f"🧠 Gemini ({_html.escape(model)}) — думаю…\n"
+                    f"🧠 {_html.escape(label)} — думаю…\n"
                     f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
                     f"{body_html}"
                 )
@@ -887,21 +1571,31 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 except Exception:
                     pass
 
-            out = await _gemini_stream_generate(
-                api_key=api_key,
-                model=model,
-                prompt=full_prompt,
-                system_prompt=system_prompt,
-                generation_config=generation_config,
-                on_update=on_update,
-            )
+            if provider == "gemini":
+                if not api_key:
+                    raise RuntimeError("Не задан GEMINI_API_KEY в `.env`.")
+                out = await _gemini_stream_generate(
+                    api_key=api_key,
+                    model=model,
+                    prompt=full_prompt,
+                    system_prompt=system_prompt,
+                    generation_config=generation_config,
+                    on_update=on_update,
+                )
+            else:
+                out = await _ollama_stream_generate(
+                    model=model,
+                    prompt=full_prompt,
+                    system_prompt=system_prompt,
+                    on_update=on_update,
+                )
             await _safe_delete(status)
             out = out or "(пусто)"
             await _reply_long_html(update, _markdown_to_telegram_html(out))
         except Exception as exc:
-            logging.getLogger("local_telegram_bot").exception("Gemini failed")
+            logging.getLogger("local_telegram_bot").exception("LLM failed")
             await _safe_delete(status)
-            await msg.reply_text(f"Ошибка Gemini: {exc}")
+            await msg.reply_text(f"Ошибка LLM: {exc}")
 
 
 async def handle_process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -910,6 +1604,27 @@ async def handle_process_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     text = msg.text.strip()
     low = text.lower()
+
+    # Email auth: if user has a pending code, try to verify it on any non-command text.
+    user = update.effective_user
+    if user is not None and _auth_enabled():
+        user_id = int(user.id)
+        if _auth_has_pending(user_id) and not (low == "обработать" or low.startswith("обработать ")):
+            ok, reply = _auth_verify_code(user_id, text)
+            await msg.reply_text(reply)
+            return
+
+        # Convenience: allow sending email address as a plain message.
+        domain = _auth_domain()
+        if (
+            "@" in text
+            and text.lower().endswith(f"@{domain}")
+            and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text.strip().lower())
+        ):
+            context.args = [text.strip()]
+            await cmd_auth(update, context)
+            return
+
     if not (low == "обработать" or low.startswith("обработать ")):
         return
     prompt = text[len("обработать") :].strip()
@@ -1053,6 +1768,37 @@ async def _process_audio(
                 "language": language,
                 "hf_token": bool(hf_token),
             }
+
+            # Authorization (optional) / whitelist:
+            # When AUTH_ENABLED=1, Gemini is allowed only for authorized users,
+            # but an authorized user can "whitelist" a group chat on first use.
+            user_id0 = int(getattr(user, "id", 0) or 0)
+            chat_id0 = int(getattr(chat, "id", 0) or 0)
+            auth_enabled = _auth_enabled()
+            user_authorized = bool(user_id0 and _auth_is_user_authorized(user_id0))
+            chat_whitelisted = bool(chat_id0 and _auth_is_chat_whitelisted(chat_id0))
+            whitelisted_now = False
+            if auth_enabled and user_id0 and chat_id0 and _is_group_chat(update):
+                whitelisted_now = _auth_maybe_whitelist_chat(user_id=user_id0, chat_id=chat_id0)
+                if whitelisted_now:
+                    chat_whitelisted = True
+            can_use_gemini = bool(user_id0 and chat_id0 and ((not auth_enabled) or user_authorized or chat_whitelisted))
+            session["auth"] = {
+                "enabled": auth_enabled,
+                "user_authorized": user_authorized,
+                "chat_whitelisted": chat_whitelisted,
+                "chat_whitelisted_now": whitelisted_now,
+                "can_use_gemini": can_use_gemini,
+            }
+
+            if user_id0 and not can_use_gemini and _auth_should_prompt_user(user_id0):
+                # Don't block: just inform once how to enable Gemini.
+                _auth_mark_prompted(user_id0)
+                domain = _auth_domain()
+                await reply_target.reply_text(
+                    f"ℹ️ Gemini доступен только после авторизации по домену {domain}.\n"
+                    f"Чтобы авторизоваться, напишите мне в личку: /auth <email@{domain}>"
+                )
 
             # Single "status/progress" message. It is recreated between stages so it's always below previously sent text.
             progress = await reply_target.reply_text("Старт…")
@@ -1228,89 +1974,136 @@ async def _process_audio(
                         gigaam_text=g_text,
                     )
 
-                gemini_text = ""
-                gemini_error = ""
-                if gemini_api_key and chat_id is not None:
+                final_text = ""
+                final_error = ""
+                final_label = ""
+
+                user_prompt = (
+                    "Whisper:\n"
+                    f"{w_text.strip()}\n\n"
+                    "GigaAM:\n"
+                    f"{g_text.strip()}\n"
+                )
+
+                if chat_id is not None:
                     await _safe_delete(progress)
-                    progress = await reply_target.reply_text(f"🧠 Gemini ({gemini_model}) — думаю над итогом…")
-                    gmi0 = time.monotonic()
 
-                    async def on_update(thoughts: str, elapsed_sec: float) -> None:
-                        body = _trim_for_telegram(thoughts or "(пока без мыслей)")
-                        body_html = _markdown_bold_lines_to_html(body)
-                        text_html = (
-                            f"🧠 Gemini ({_html.escape(gemini_model)}) — думаю над итогом…\n"
-                            f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
-                            f"{body_html}"
-                        )
-                        await _safe_edit_formatted(progress, text_html, parse_mode=ParseMode.HTML)
+                    if can_use_gemini and gemini_api_key:
+                        final_label = f"Gemini ({gemini_model})"
+                        progress = await reply_target.reply_text(f"🧠 {final_label} — думаю над итогом…")
+                        gmi0 = time.monotonic()
+
+                        async def on_update(thoughts: str, elapsed_sec: float) -> None:
+                            body = _trim_for_telegram(thoughts or "(пока без мыслей)")
+                            body_html = _markdown_bold_lines_to_html(body)
+                            text_html = (
+                                f"🧠 { _html.escape(final_label) } — думаю над итогом…\n"
+                                f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
+                                f"{body_html}"
+                            )
+                            await _safe_edit_formatted(progress, text_html, parse_mode=ParseMode.HTML)
+                            try:
+                                await context.bot.send_chat_action(chat_id=int(chat_id), action=ChatAction.TYPING)
+                            except Exception:
+                                pass
+
+                        generation_config = {
+                            "temperature": _parse_float_env(os.environ.get("GEMINI_TEMPERATURE") or "1", 1.0),
+                            "topP": _parse_float_env(os.environ.get("GEMINI_TOP_P") or "0.95", 0.95),
+                            "maxOutputTokens": _parse_int_env(
+                                os.environ.get("GEMINI_MAX_OUTPUT_TOKENS") or "65536", 65536
+                            ),
+                            "mediaResolution": _media_resolution_value(os.environ.get("GEMINI_MEDIA_RESOLUTION") or "default"),
+                            "thinkingConfig": {
+                                "thinkingLevel": _thinking_level_value(os.environ.get("GEMINI_THINKING_LEVEL") or "high"),
+                                "includeThoughts": True,
+                            },
+                        }
+
                         try:
-                            await context.bot.send_chat_action(chat_id=int(chat_id), action=ChatAction.TYPING)
-                        except Exception:
-                            pass
+                            final_text = await _gemini_stream_generate(
+                                api_key=gemini_api_key,
+                                model=gemini_model,
+                                prompt=user_prompt,
+                                system_prompt=gemini_system_prompt,
+                                generation_config=generation_config,
+                                on_update=on_update,
+                            )
+                        except Exception as exc:
+                            logging.getLogger("local_telegram_bot").exception("Gemini default processing failed")
+                            final_error = str(exc)
+                        finally:
+                            session["timings"]["llm_sec"] = round(time.monotonic() - gmi0, 3)
+                            session["results"]["llm_provider"] = "gemini"
+                            session["results"]["llm_model"] = gemini_model
+                    else:
+                        local_model = _ollama_model()
+                        final_label = f"Local ({local_model})"
+                        progress = await reply_target.reply_text(f"🧠 {final_label} — думаю над итогом…")
+                        llm0 = time.monotonic()
 
-                    generation_config = {
-                        "temperature": _parse_float_env(os.environ.get("GEMINI_TEMPERATURE") or "1", 1.0),
-                        "topP": _parse_float_env(os.environ.get("GEMINI_TOP_P") or "0.95", 0.95),
-                        "maxOutputTokens": _parse_int_env(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS") or "65536", 65536),
-                        "mediaResolution": _media_resolution_value(os.environ.get("GEMINI_MEDIA_RESOLUTION") or "default"),
-                        "thinkingConfig": {
-                            "thinkingLevel": _thinking_level_value(os.environ.get("GEMINI_THINKING_LEVEL") or "high"),
-                            "includeThoughts": True,
-                        },
-                    }
-                    user_prompt = (
-                        "Whisper:\n"
-                        f"{w_text.strip()}\n\n"
-                        "GigaAM:\n"
-                        f"{g_text.strip()}\n"
-                    )
-                    try:
-                        gemini_text = await _gemini_stream_generate(
-                            api_key=gemini_api_key,
-                            model=gemini_model,
-                            prompt=user_prompt,
-                            system_prompt=gemini_system_prompt,
-                            generation_config=generation_config,
-                            on_update=on_update,
-                        )
-                    except Exception as exc:
-                        logging.getLogger("local_telegram_bot").exception("Gemini default processing failed")
-                        gemini_error = str(exc)
-                    finally:
-                        session["timings"]["gemini_sec"] = round(time.monotonic() - gmi0, 3)
-                elif not gemini_api_key:
-                    gemini_error = "GEMINI_API_KEY не задан — пропускаю обработку Gemini."
+                        async def on_update(thoughts: str, elapsed_sec: float) -> None:
+                            body = _trim_for_telegram(thoughts or "(думаю…)")
+                            body_html = _markdown_bold_lines_to_html(body)
+                            text_html = (
+                                f"🧠 { _html.escape(final_label) } — думаю над итогом…\n"
+                                f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
+                                f"{body_html}"
+                            )
+                            await _safe_edit_formatted(progress, text_html, parse_mode=ParseMode.HTML)
+                            try:
+                                await context.bot.send_chat_action(chat_id=int(chat_id), action=ChatAction.TYPING)
+                            except Exception:
+                                pass
+
+                        try:
+                            final_text = await _ollama_stream_generate(
+                                model=local_model,
+                                prompt=user_prompt,
+                                system_prompt=gemini_system_prompt,
+                                on_update=on_update,
+                            )
+                        except Exception as exc:
+                            logging.getLogger("local_telegram_bot").exception("Local LLM processing failed")
+                            final_error = str(exc)
+                        finally:
+                            session["timings"]["llm_sec"] = round(time.monotonic() - llm0, 3)
+                            session["results"]["llm_provider"] = "ollama"
+                            session["results"]["llm_model"] = local_model
+                else:
+                    final_error = "Не удалось определить chat_id для LLM."
+                    final_label = "LLM"
 
                 if progress:
                     await _safe_edit(progress, "📄 Формирую итоговый файл…")
 
-                if gemini_text and not transcripts_exceed_single_message:
-                    chat_text = _gemini_chat_excerpt(gemini_text)
+                if final_text and not transcripts_exceed_single_message:
+                    chat_text = _gemini_chat_excerpt(final_text)
                     if chat_text.strip():
                         await _reply_long_html(update, _markdown_to_telegram_html(chat_text.strip()))
-                elif gemini_error:
-                    await reply_target.reply_text(f"Gemini: ошибка/пропуск: {gemini_error}")
+                elif final_error:
+                    await reply_target.reply_text(f"LLM: ошибка/пропуск: {final_error}")
 
                 session["results"].update(
                     {
-                        "gemini_used": bool(gemini_api_key),
-                        "gemini_error": gemini_error or None,
-                        "gemini_len": len(gemini_text or ""),
+                        "llm_used": bool(final_text),
+                        "llm_error": final_error or None,
+                        "llm_len": len(final_text or ""),
                     }
                 )
 
                 await _send_markdown_file(
                     update,
-                    gemini_text=gemini_text,
-                    gemini_error=gemini_error,
+                    final_text=final_text,
+                    final_error=final_error,
+                    final_label=final_label or "LLM",
                     whisper_text=w_text,
                     gigaam_text=g_text,
                 )
                 session.setdefault("telegram", {}).update(
                     {
                         "sent_transcripts_to_chat": not transcripts_exceed_single_message,
-                        "sent_gemini_to_chat": bool(gemini_text) and not transcripts_exceed_single_message,
+                        "sent_gemini_to_chat": bool(final_text) and not transcripts_exceed_single_message,
                         "sent_markdown_file": True,
                     }
                 )
@@ -1556,8 +2349,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 await _send_markdown_file(
                     update,
-                    gemini_text=gemini_text,
-                    gemini_error=gemini_error,
+                    final_text=gemini_text,
+                    final_error=gemini_error,
+                    final_label=f"Gemini ({gemini_model})",
                     whisper_text=w_text,
                     gigaam_text=g_text,
                 )
@@ -1614,6 +2408,7 @@ def main() -> None:
 
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("auth", cmd_auth))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("process", cmd_process))
     app.add_handler(CommandHandler("obrabotat", cmd_process))

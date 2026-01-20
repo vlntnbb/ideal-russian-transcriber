@@ -629,6 +629,39 @@ def _active_sessions(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.application.bot_data.setdefault("active_sessions", {})
 
 
+def _ru_plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(int(n))
+    if (n % 10) == 1 and (n % 100) != 11:
+        return one
+    if 2 <= (n % 10) <= 4 and not (12 <= (n % 100) <= 14):
+        return few
+    return many
+
+
+def _active_sessions_summary_line(context: ContextTypes.DEFAULT_TYPE) -> str:
+    sessions = _active_sessions(context) or {}
+    files = len(sessions)
+    if files <= 0:
+        return ""
+
+    user_keys = set()
+    for sid, sess in sessions.items():
+        if not isinstance(sess, dict):
+            user_keys.add(("s", sid))
+            continue
+        uid = sess.get("user_id")
+        if uid:
+            user_keys.add(("u", int(uid)))
+        else:
+            user_keys.add(("s", sid))
+
+    users = len(user_keys)
+    file_word = _ru_plural(files, "файл", "файла", "файлов")
+    # Genitive after "от":
+    user_word = _ru_plural(users, "пользователя", "пользователей", "пользователей")
+    return f"В процессе обработки {files} {file_word} от {users} {user_word}."
+
+
 async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = getattr(update, "callback_query", None)
     if not q or not getattr(q, "data", None):
@@ -752,7 +785,11 @@ async def _ticker(
             else:
                 line = f"⏱ {_fmt_dur(elapsed_sec)}"
 
-            retry_after = await _safe_edit_message(message, f"{base_text}\n{line}", reply_markup=reply_markup)
+            summary = _active_sessions_summary_line(context)
+            text = f"{base_text}\n{line}"
+            if summary:
+                text += f"\n{summary}"
+            retry_after = await _safe_edit_message(message, text, reply_markup=reply_markup)
             try:
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             except RetryAfter as exc:
@@ -1754,7 +1791,11 @@ async def _process_audio(
     async with sem:
         session_id = uuid.uuid4().hex
         cancel_event = asyncio.Event()
-        _active_sessions(context)[session_id] = {"cancel_event": cancel_event}
+        _active_sessions(context)[session_id] = {
+            "cancel_event": cancel_event,
+            "user_id": int(getattr(getattr(update, "effective_user", None), "id", 0) or 0),
+            "chat_id": int(getattr(getattr(update, "effective_chat", None), "id", 0) or 0),
+        }
         started_at = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
         t0 = time.monotonic()
         user = update.effective_user
@@ -2070,9 +2111,11 @@ async def _process_audio(
                         async def on_update(thoughts: str, elapsed_sec: float) -> None:
                             body = _trim_for_telegram(thoughts or "(пока без мыслей)")
                             body_html = _markdown_bold_lines_to_html(body)
+                            summary = _active_sessions_summary_line(context)
+                            summary_line = f"\n{_html.escape(summary)}" if summary else ""
                             text_html = (
                                 f"🧠 { _html.escape(final_label) } — думаю над итогом…\n"
-                                f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
+                                f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}{summary_line}\n\n"
                                 f"{body_html}"
                             )
                             await _safe_edit_message(progress, text_html, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -2126,9 +2169,11 @@ async def _process_audio(
                         async def on_update(thoughts: str, elapsed_sec: float) -> None:
                             body = _trim_for_telegram(thoughts or "(думаю…)")
                             body_html = _markdown_bold_lines_to_html(body)
+                            summary = _active_sessions_summary_line(context)
+                            summary_line = f"\n{_html.escape(summary)}" if summary else ""
                             text_html = (
                                 f"🧠 { _html.escape(final_label) } — думаю над итогом…\n"
-                                f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
+                                f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}{summary_line}\n\n"
                                 f"{body_html}"
                             )
                             await _safe_edit_message(progress, text_html, parse_mode=ParseMode.HTML, reply_markup=markup)

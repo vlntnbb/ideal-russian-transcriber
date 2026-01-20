@@ -22,10 +22,10 @@ from email.message import EmailMessage
 from typing import Optional
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, RetryAfter
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 import httpx
 
 from snapscript.core.audio_processor import AudioProcessor, GigaAMTranscriptionService, TranscriptionService
@@ -52,6 +52,7 @@ STATS_PATH = os.path.join(os.path.dirname(__file__), "asr_stats.json")
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_USAGE_LOG_PATH = os.path.join(os.path.dirname(__file__), "usage_sessions.jsonl")
 AUTH_STATE_PATH = os.path.join(os.path.dirname(__file__), "auth_state.json")
+DEFAULT_GEMINI_SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "gemini_system_prompt.md")
 
 # Email auth: only this domain can authorize users for Gemini access.
 DEFAULT_AUTH_DOMAIN = "bbooster.io"
@@ -80,6 +81,32 @@ DEFAULT_GEMINI_SYSTEM_PROMPT = """\
 """
 
 
+def _read_text_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _get_system_prompt() -> tuple[str, str]:
+    """
+    Returns (prompt, source) where source is one of: file/env/default.
+    Priority: GEMINI_SYSTEM_PROMPT_FILE -> GEMINI_SYSTEM_PROMPT -> default constant.
+    """
+    p = (os.environ.get("GEMINI_SYSTEM_PROMPT_FILE") or "").strip()
+    candidate = p or DEFAULT_GEMINI_SYSTEM_PROMPT_PATH
+    try:
+        if candidate and os.path.exists(candidate):
+            out = (_read_text_file(candidate) or "").strip()
+            if out:
+                return out, f"file:{candidate}"
+    except Exception:
+        logging.getLogger("local_telegram_bot").exception("Failed to read system prompt file: %s", candidate)
+
+    env_prompt = (os.environ.get("GEMINI_SYSTEM_PROMPT") or "").strip()
+    if env_prompt:
+        return env_prompt, "env"
+    return DEFAULT_GEMINI_SYSTEM_PROMPT.strip(), "default"
+
+
 def _fmt_dur(sec: float) -> str:
     sec = max(0, int(sec))
     if sec < 60:
@@ -96,6 +123,26 @@ def _truthy_env(name: str, default: bool = True) -> bool:
     if not raw:
         return default
     return raw not in {"0", "false", "no", "off", "disabled"}
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        return int(raw) if raw else int(default)
+    except Exception:
+        return int(default)
+
+
+def _bot_concurrent_updates() -> int:
+    return max(1, _int_env("BOT_CONCURRENT_UPDATES", 8))
+
+
+def _asr_concurrency() -> int:
+    return max(1, _int_env("ASR_CONCURRENCY", 2))
+
+
+def _llm_concurrency() -> int:
+    return max(1, _int_env("LLM_CONCURRENCY", 2))
 
 
 _SPELL_WORDS = [
@@ -330,7 +377,7 @@ def _auth_verify_code(user_id: int, text: str) -> tuple[bool, str]:
         st = _load_auth_state()
         pending = (st.get("pending") or {}).get(uid)
         if not pending:
-            return False, f"Нет активного кода. Отправьте `/auth <email@{domain}>`."
+            return False, f"Нет активного кода. Отправьте мне вашу почту вида `email@{domain}`."
 
         expires_at = (pending.get("expires_at") or "").strip()
         try:
@@ -340,7 +387,7 @@ def _auth_verify_code(user_id: int, text: str) -> tuple[bool, str]:
         if not exp or exp <= datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc):
             st["pending"].pop(uid, None)
             _save_auth_state(st)
-            return False, f"Код истёк. Отправьте `/auth <email@{domain}>` ещё раз."
+            return False, f"Код истёк. Отправьте мне вашу почту вида `email@{domain}` ещё раз."
 
         expected = _normalize_code(pending.get("code") or "")
         if norm != expected:
@@ -348,7 +395,7 @@ def _auth_verify_code(user_id: int, text: str) -> tuple[bool, str]:
             if pending["attempts"] >= 5:
                 st["pending"].pop(uid, None)
                 _save_auth_state(st)
-                return False, f"Слишком много попыток. Отправьте `/auth <email@{domain}>` ещё раз."
+                return False, f"Слишком много попыток. Отправьте мне вашу почту вида `email@{domain}` ещё раз."
             _save_auth_state(st)
             return False, "Код не совпал. Проверьте слова и порядок (как в письме) и попробуйте ещё раз."
 
@@ -522,6 +569,40 @@ class _ProgressState:
             self.est_total_sec = max(elapsed_sec, prev, base)
 
 
+def _parse_timeout_env(name: str) -> Optional[float]:
+    """
+    Returns:
+    - None when unset/empty (meaning: use dynamic default)
+    - 0.0 when set to 0 or negative (meaning: disable timeout)
+    - float seconds when set to a positive number
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+    except Exception:
+        return None
+    if v <= 0:
+        return 0.0
+    return v
+
+
+def _default_whisper_timeout_sec(*, audio_sec: float) -> float:
+    """
+    Dynamic default timeout for Whisper (seconds).
+    The old fixed 240s is too small for long audio; keep a conservative scaling.
+    """
+    audio_sec = float(audio_sec or 0.0)
+    rtf = _get_rtf_est("whisper") or 0.0
+    if rtf <= 0:
+        # Conservative fallback (CPU medium can be slow on some machines).
+        rtf = 0.6
+    est = max(60.0, audio_sec * rtf)
+    # Give extra slack for warmup/IO and variability.
+    return max(300.0, est * 2.0 + 120.0)
+
+
 def _chunks(text: str, *, limit: int = TELEGRAM_TEXT_LIMIT - 50):
     text = text or ""
     while len(text) > limit:
@@ -532,6 +613,53 @@ def _chunks(text: str, *, limit: int = TELEGRAM_TEXT_LIMIT - 50):
         text = text[cut:].lstrip()
     if text.strip():
         yield text
+
+
+def _cancel_markup(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Отменить обработку", callback_data=f"cancel:{session_id}")]]
+    )
+
+
+class _UserCancelled(Exception):
+    pass
+
+
+def _active_sessions(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.application.bot_data.setdefault("active_sessions", {})
+
+
+async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = getattr(update, "callback_query", None)
+    if not q or not getattr(q, "data", None):
+        return
+    data = str(q.data)
+    if not data.startswith("cancel:"):
+        return
+
+    session_id = data.split(":", 1)[1].strip()
+    sess = (_active_sessions(context) or {}).get(session_id)
+    if not sess:
+        try:
+            await q.answer("Сессия уже завершена.", show_alert=False)
+        except Exception:
+            pass
+        return
+
+    ev = sess.get("cancel_event")
+    if isinstance(ev, asyncio.Event):
+        ev.set()
+
+    try:
+        await q.answer("Ок, отменяю…", show_alert=False)
+    except Exception:
+        pass
+
+    # Best-effort update the status message itself (button will be removed).
+    try:
+        await q.message.edit_text("⛔️ Отмена запрошена — завершаю текущий шаг…", reply_markup=None)
+    except Exception:
+        pass
 
 
 async def _reply_long(update: Update, text: str) -> None:
@@ -567,6 +695,27 @@ async def _safe_edit_formatted(message, text: str, *, parse_mode: Optional[str] 
         return None
 
 
+async def _safe_edit_message(
+    message,
+    text: str,
+    *,
+    parse_mode: Optional[str] = None,
+    reply_markup=None,
+) -> Optional[float]:
+    """
+    Like `_safe_edit`, but supports parse_mode and reply_markup (inline keyboards).
+    """
+    try:
+        if not message:
+            return None
+        await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return None
+    except RetryAfter as exc:
+        return float(getattr(exc, "retry_after", 0) or 0) or 1.0
+    except Exception:
+        return None
+
+
 async def _safe_delete(message) -> None:
     try:
         if message:
@@ -581,12 +730,16 @@ async def _ticker(
     chat_id: int,
     message,
     base_text: str,
+    reply_markup=None,
     state: Optional[_ProgressState] = None,
+    cancel_event: Optional[asyncio.Event] = None,
     interval_sec: float = 5.0,
 ) -> None:
     start = time.monotonic()
     try:
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             elapsed_sec = time.monotonic() - start
             if state is not None:
                 state.update_estimate(elapsed_sec)
@@ -599,7 +752,7 @@ async def _ticker(
             else:
                 line = f"⏱ {_fmt_dur(elapsed_sec)}"
 
-            retry_after = await _safe_edit(message, f"{base_text}\n{line}")
+            retry_after = await _safe_edit_message(message, f"{base_text}\n{line}", reply_markup=reply_markup)
             try:
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             except RetryAfter as exc:
@@ -623,43 +776,29 @@ def _get_env(name: str, default: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ = context
     domain = _auth_domain()
-    auth_line = (
-        f"Для доступа к Gemini (только домен {domain}): /auth <email@{domain}>"
-        if _auth_enabled()
-        else "Авторизация Gemini отключена (AUTH_ENABLED=0)."
-    )
-    await update.effective_message.reply_text(
-        "Отправьте voice/audio — верну транскрипцию двумя моделями: Whisper и GigaAM.\n"
-        "Команды: /models, /process (или напишите: `обработать <промпт>`)\n\n"
-        f"{auth_line}"
+    intro = (
+        "Добро пожаловать в идеальный (ну почти :)) транскрибатор русских аудио сообщений. "
+        "Я использую для транскрибации две модели: Whisper и GigaAM, "
+        "а затем с помощью LLM делаю их сравнительный анализ и итоговый вариант транскрибации.\n\n"
+        "Бот хорошо подходит для задач, когда важна точность транскрибации, а не скорость: "
+        "подготовка постов для social media, должностных инструкций и т.п.\n\n"
     )
 
+    if _auth_enabled():
+        auth_block = (
+            "Если вы сотрудник Business Booster, авторизуйтесь по корпоративной почте, "
+            "тогда вам будет доступна более качественная платная модель Gemini 3 Pro.\n\n"
+            f"Просто отправьте мне вашу почту вида `email@{domain}`.\n\n"
+            "Если вы гость, то можете использовать бот бесплатно на локальной модели "
+            "(это значительно медленнее и чуть менее точно, но тоже неплохо)."
+        )
+    else:
+        auth_block = (
+            "Авторизация отключена (AUTH_ENABLED=0). "
+            "Бот будет работать с доступной LLM без проверки домена."
+        )
 
-async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _ = context
-    whisper_model = _get_env("WHISPER_MODEL", "medium")
-    gigaam_model = _get_env("GIGAAM_MODEL", "v3_e2e_rnnt")
-    device = _get_env("DEVICE", "cpu")
-    language = _get_env("LANGUAGE", "ru")
-    gemini_model = _get_env("GEMINI_MODEL", "gemini-3-pro-preview")
-    gemini_key = bool((_get_env("GEMINI_API_KEY", "") or "").strip())
-    gemini_temperature = _get_env("GEMINI_TEMPERATURE", "1")
-    gemini_top_p = _get_env("GEMINI_TOP_P", "0.95")
-    gemini_max_output = _get_env("GEMINI_MAX_OUTPUT_TOKENS", "65536")
-    gemini_media_res = _get_env("GEMINI_MEDIA_RESOLUTION", "default")
-    gemini_thinking = _get_env("GEMINI_THINKING_LEVEL", "high")
-    await update.effective_message.reply_text(
-        "ASR:\n"
-        f"WHISPER_MODEL={whisper_model}\nGIGAAM_MODEL={gigaam_model}\nDEVICE={device}\nLANGUAGE={language}\n\n"
-        "LLM:\n"
-        f"GEMINI_MODEL={gemini_model}\n"
-        f"GEMINI_API_KEY={'set' if gemini_key else 'not set'}\n"
-        f"GEMINI_TEMPERATURE={gemini_temperature}\n"
-        f"GEMINI_TOP_P={gemini_top_p}\n"
-        f"GEMINI_MAX_OUTPUT_TOKENS={gemini_max_output}\n"
-        f"GEMINI_MEDIA_RESOLUTION={gemini_media_res}\n"
-        f"GEMINI_THINKING_LEVEL={gemini_thinking}"
-    )
+    await update.effective_message.reply_text(intro + auth_block)
 
 
 async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -680,12 +819,67 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     domain = _auth_domain()
     email = (" ".join(context.args or [])).strip()
     if not email:
-        await msg.reply_text(f"Использование: /auth <email@{domain}>")
+        await msg.reply_text(f"Отправьте мне вашу почту вида `email@{domain}`.")
         return
 
     email = email.strip().lower()
     # Minimal email validation (enough for domain-gated auth).
     # NOTE: must use `\s` (whitespace), not `\\s` (literal "s" + backslash in a char-class).
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        await msg.reply_text(f"Неверный email. Пример: name@{domain}")
+        return
+    if not email.endswith(f"@{domain}"):
+        await msg.reply_text(f"Авторизация доступна только для домена {domain}.")
+        return
+
+    code = _auth_start_pending(user_id, email)
+    ttl_min = max(1, int(_auth_code_ttl_sec() / 60))
+
+    subject = "Ideal Russian Transcriber — код авторизации"
+    body = (
+        "Чтобы авторизоваться в боте, отправьте в Telegram следующую фразу (слова и порядок важны):\n\n"
+        f"{code}\n\n"
+        f"Код действителен {ttl_min} минут."
+    )
+
+    await msg.reply_text(f"📧 Отправляю код на {email}…")
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, lambda: _smtp_send_email(to_email=email, subject=subject, body=body))
+    except Exception as exc:
+        logging.getLogger("local_telegram_bot").exception("Failed to send auth email")
+        await msg.reply_text(
+            "Не удалось отправить письмо. Проверьте SMTP настройки в `.env` "
+            "(SMTP_HOST/SMTP_PORT/SMTP_USERNAME/SMTP_PASSWORD/SMTP_FROM).\n"
+            f"Ошибка: {exc}"
+        )
+        return
+
+    mn, mx = _auth_code_word_count()
+    await msg.reply_text(f"✅ Письмо отправлено на {email}.\nПришлите сюда код из {mn}-{mx} слов (как в письме).")
+
+
+async def _begin_email_auth(update: Update, context: ContextTypes.DEFAULT_TYPE, *, email: str) -> None:
+    """
+    Starts email authorization flow from a plain email message (no /auth command required).
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
+        return
+
+    if not _auth_enabled():
+        await msg.reply_text("Авторизация отключена (AUTH_ENABLED=0).")
+        return
+
+    user_id = int(user.id)
+    domain = _auth_domain()
+    email = (email or "").strip().lower()
+
+    if _auth_is_user_authorized(user_id):
+        await msg.reply_text("✅ Вы уже авторизованы.")
+        return
+
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
         await msg.reply_text(f"Неверный email. Пример: name@{domain}")
         return
@@ -844,52 +1038,6 @@ async def _send_markdown_file(
     bio = io.BytesIO(content.encode("utf-8"))
     bio.name = filename
     await msg.reply_document(document=bio, filename=filename)
-
-
-def _get_last_transcripts(context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, user_id: int) -> Optional[dict]:
-    store = context.application.bot_data.get("last_transcripts") or {}
-    return store.get(f"{chat_id}:{user_id}")
-
-
-def _set_last_transcripts(
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    chat_id: int,
-    user_id: int,
-    whisper_text: str,
-    gigaam_text: str,
-) -> None:
-    store = context.application.bot_data.setdefault("last_transcripts", {})
-    store[f"{chat_id}:{user_id}"] = {
-        "whisper": whisper_text or "",
-        "gigaam": gigaam_text or "",
-        "ts": time.time(),
-    }
-
-
-def _parse_process_args(text: str) -> tuple[Optional[str], str]:
-    """
-    Returns (model_override, prompt).
-    Supported:
-      /process <prompt>
-      /process model=<name> <prompt>
-      /process модель=<name> <prompt>
-    """
-    raw = (text or "").strip()
-    if not raw:
-        return None, ""
-    parts = raw.split()
-    if not parts:
-        return None, ""
-
-    first = parts[0].strip()
-    for key in ("model=", "model:", "модель=", "модель:"):
-        if first.lower().startswith(key):
-            model = first.split("=", 1)[1] if "=" in first else first.split(":", 1)[1]
-            model = (model or "").strip() or None
-            prompt = " ".join(parts[1:]).strip()
-            return model, prompt
-    return None, raw
 
 
 def _parse_float_env(value: str, default: float) -> float:
@@ -1109,6 +1257,7 @@ async def _gemini_stream_generate(
     system_prompt: Optional[str],
     generation_config: dict,
     on_update,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> str:
     """
     Streams `:streamGenerateContent` and calls `on_update(thoughts, elapsed_sec)` periodically.
@@ -1142,6 +1291,8 @@ async def _gemini_stream_generate(
         ) as r:
             r.raise_for_status()
             async for raw_line in r.aiter_lines():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise _UserCancelled()
                 line = (raw_line or "").strip()
                 if not line:
                     continue
@@ -1411,6 +1562,7 @@ async def _ollama_stream_generate(
     prompt: str,
     system_prompt: Optional[str],
     on_update,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> str:
     """
     Streams Ollama `/api/chat`. Calls `on_update(thoughts, elapsed_sec)` periodically.
@@ -1449,6 +1601,8 @@ async def _ollama_stream_generate(
         async with client.stream("POST", url, json=payload) as r:
             r.raise_for_status()
             async for line in r.aiter_lines():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise _UserCancelled()
                 if not line:
                     continue
                 try:
@@ -1483,121 +1637,6 @@ async def _ollama_stream_generate(
     return out
 
 
-async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if msg is None:
-        return
-
-    chat_id = int(update.effective_chat.id) if update.effective_chat else None
-    user_id = int(update.effective_user.id) if update.effective_user else None
-    if chat_id is None or user_id is None:
-        await msg.reply_text("Не удалось определить chat/user.")
-        return
-
-    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-
-    model_override, user_prompt = _parse_process_args(" ".join(context.args or []))
-    if not user_prompt:
-        await msg.reply_text(
-            "Использование:\n"
-            "`/process <промпт>`\n"
-            "или\n"
-            "`/process model=<gemini-model> <промпт>`"
-        )
-        return
-
-    last = _get_last_transcripts(context, chat_id=chat_id, user_id=user_id)
-    if not last:
-        await msg.reply_text("Нет сохранённой транскрипции. Сначала отправьте voice/audio.")
-        return
-
-    # If an authorized user uses /process in a group for the first time, whitelist this chat.
-    if _is_group_chat(update):
-        _auth_maybe_whitelist_chat(user_id=user_id, chat_id=chat_id)
-
-    can_use_gemini = _auth_can_use_gemini(user_id, chat_id)
-    if not can_use_gemini and _auth_should_prompt_user(user_id):
-        _auth_mark_prompted(user_id)
-        domain = _auth_domain()
-        await msg.reply_text(
-            f"ℹ️ Gemini доступен только после авторизации по домену {domain}.\n"
-            f"Чтобы авторизоваться, напишите: /auth <email@{domain}>\n\n"
-            "Пока что обработаю через локальную open-source модель."
-        )
-
-    provider = "gemini" if (can_use_gemini and api_key) else "ollama"
-    model = (model_override or os.environ.get("GEMINI_MODEL") or "gemini-3-pro-preview").strip() if provider == "gemini" else _ollama_model()
-    generation_config = {
-        # Match the UI defaults from your screenshot:
-        "temperature": _parse_float_env(os.environ.get("GEMINI_TEMPERATURE") or "1", 1.0),
-        "topP": _parse_float_env(os.environ.get("GEMINI_TOP_P") or "0.95", 0.95),
-        "maxOutputTokens": _parse_int_env(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS") or "65536", 65536),
-        "mediaResolution": _media_resolution_value(os.environ.get("GEMINI_MEDIA_RESOLUTION") or "default"),
-        "thinkingConfig": {
-            "thinkingLevel": _thinking_level_value(os.environ.get("GEMINI_THINKING_LEVEL") or "high"),
-            "includeThoughts": True,
-        },
-    }
-    system_prompt = (os.environ.get("GEMINI_SYSTEM_PROMPT") or "").strip() or DEFAULT_GEMINI_SYSTEM_PROMPT
-    full_prompt = (
-        "У тебя есть две транскрипции одного и того же аудио.\n\n"
-        "Whisper:\n"
-        f"{(last.get('whisper') or '').strip()}\n\n"
-        "GigaAM:\n"
-        f"{(last.get('gigaam') or '').strip()}\n\n"
-        "Задание пользователя:\n"
-        f"{user_prompt.strip()}\n"
-    )
-
-    llm_sem: asyncio.Semaphore = context.application.bot_data.setdefault("llm_semaphore", asyncio.Semaphore(1))
-    async with llm_sem:
-        label = ("Gemini" if provider == "gemini" else "Local") + f" ({model})"
-        status = await msg.reply_text(f"🧠 {label} — обрабатываю…")
-        try:
-            async def on_update(thoughts: str, elapsed_sec: float) -> None:
-                if not update.effective_chat:
-                    return
-                # Best-effort "live thoughts" UI; will be deleted when done.
-                body = _trim_for_telegram(thoughts or "(пока без мыслей)")
-                body_html = _markdown_bold_lines_to_html(body)
-                text_html = (
-                    f"🧠 {_html.escape(label)} — думаю…\n"
-                    f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
-                    f"{body_html}"
-                )
-                await _safe_edit_formatted(status, text_html, parse_mode=ParseMode.HTML)
-                try:
-                    await context.bot.send_chat_action(chat_id=int(update.effective_chat.id), action=ChatAction.TYPING)
-                except Exception:
-                    pass
-
-            if provider == "gemini":
-                if not api_key:
-                    raise RuntimeError("Не задан GEMINI_API_KEY в `.env`.")
-                out = await _gemini_stream_generate(
-                    api_key=api_key,
-                    model=model,
-                    prompt=full_prompt,
-                    system_prompt=system_prompt,
-                    generation_config=generation_config,
-                    on_update=on_update,
-                )
-            else:
-                out = await _ollama_stream_generate(
-                    model=model,
-                    prompt=full_prompt,
-                    system_prompt=system_prompt,
-                    on_update=on_update,
-                )
-            await _safe_delete(status)
-            out = out or "(пусто)"
-            await _reply_long_html(update, _markdown_to_telegram_html(out))
-        except Exception as exc:
-            logging.getLogger("local_telegram_bot").exception("LLM failed")
-            await _safe_delete(status)
-            await msg.reply_text(f"Ошибка LLM: {exc}")
-
-
 async def handle_process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if msg is None or not msg.text:
@@ -1605,32 +1644,23 @@ async def handle_process_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = msg.text.strip()
     low = text.lower()
 
+    # Email auth: if message looks like an email, treat it as an auth request
+    # (works without /auth command).
+    if _auth_enabled():
+        m = re.match(r"^([^@\s]+@[^@\s]+\.[^@\s]+)$", text.strip().lower())
+        if m:
+            await _begin_email_auth(update, context, email=m.group(1))
+            return
+
     # Email auth: if user has a pending code, try to verify it on any non-command text.
     user = update.effective_user
     if user is not None and _auth_enabled():
         user_id = int(user.id)
-        if _auth_has_pending(user_id) and not (low == "обработать" or low.startswith("обработать ")):
+        if _auth_has_pending(user_id):
             ok, reply = _auth_verify_code(user_id, text)
             await msg.reply_text(reply)
             return
-
-        # Convenience: allow sending email address as a plain message.
-        domain = _auth_domain()
-        if (
-            "@" in text
-            and text.lower().endswith(f"@{domain}")
-            and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text.strip().lower())
-        ):
-            context.args = [text.strip()]
-            await cmd_auth(update, context)
-            return
-
-    if not (low == "обработать" or low.startswith("обработать ")):
-        return
-    prompt = text[len("обработать") :].strip()
-    # Emulate /process <prompt>
-    context.args = prompt.split() if prompt else []
-    await cmd_process(update, context)
+    return
 
 
 def _is_group_chat(update: Update) -> bool:
@@ -1718,9 +1748,13 @@ async def _process_audio(
     Core pipeline used by both private chats (direct voice/audio)
     and group chats (reply+mention).
     """
-    sem: asyncio.Semaphore = context.application.bot_data.setdefault("asr_semaphore", asyncio.Semaphore(1))
+    sem: asyncio.Semaphore = context.application.bot_data.setdefault(
+        "asr_semaphore", asyncio.Semaphore(_asr_concurrency())
+    )
     async with sem:
         session_id = uuid.uuid4().hex
+        cancel_event = asyncio.Event()
+        _active_sessions(context)[session_id] = {"cancel_event": cancel_event}
         started_at = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
         t0 = time.monotonic()
         user = update.effective_user
@@ -1759,7 +1793,7 @@ async def _process_audio(
             hf_token: Optional[str] = (os.environ.get("HF_TOKEN") or "").strip() or None
             gemini_api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
             gemini_model = (os.environ.get("GEMINI_MODEL") or "gemini-3-pro-preview").strip()
-            gemini_system_prompt = (os.environ.get("GEMINI_SYSTEM_PROMPT") or "").strip() or DEFAULT_GEMINI_SYSTEM_PROMPT
+            gemini_system_prompt, prompt_src = _get_system_prompt()
             session["models"] = {
                 "whisper": whisper_model,
                 "gigaam": gigaam_model,
@@ -1767,6 +1801,7 @@ async def _process_audio(
                 "device": device,
                 "language": language,
                 "hf_token": bool(hf_token),
+                "llm_system_prompt": prompt_src,
             }
 
             # Authorization (optional) / whitelist:
@@ -1797,14 +1832,20 @@ async def _process_audio(
                 domain = _auth_domain()
                 await reply_target.reply_text(
                     f"ℹ️ Gemini доступен только после авторизации по домену {domain}.\n"
-                    f"Чтобы авторизоваться, напишите мне в личку: /auth <email@{domain}>"
+                    f"Чтобы авторизоваться, отправьте мне (в личку) вашу почту вида `email@{domain}`."
                 )
 
+            def _check_cancel() -> None:
+                if cancel_event.is_set():
+                    raise _UserCancelled()
+
+            markup = _cancel_markup(session_id)
+
             # Single "status/progress" message. It is recreated between stages so it's always below previously sent text.
-            progress = await reply_target.reply_text("Старт…")
+            progress = await reply_target.reply_text("Старт…", reply_markup=markup)
             chat_id = int(update.effective_chat.id) if update.effective_chat else None
 
-            await _safe_edit(progress, "📥 Скачиваю аудио…")
+            await _safe_edit_message(progress, "📥 Скачиваю аудио…", reply_markup=markup)
             max_bytes = _telegram_max_get_file_bytes()
             if max_bytes and source_file_size and source_file_size > max_bytes:
                 size_mb = source_file_size / (1024 * 1024)
@@ -1830,28 +1871,32 @@ async def _process_audio(
                 raise
 
             with tempfile.TemporaryDirectory(prefix="tg_asr_") as td:
+                _check_cancel()
                 src_path = os.path.join(td, filename)
                 wav_dir = td
 
                 dl0 = time.monotonic()
                 await tg_file.download_to_drive(custom_path=src_path)
+                _check_cancel()
                 session["timings"] = {"download_sec": round(time.monotonic() - dl0, 3)}
 
                 ap = AudioProcessor()
                 loop = asyncio.get_running_loop()
 
-                await _safe_edit(progress, "✅ Аудио скачано\n🎛 Готовлю WAV (16kHz mono)…")
+                await _safe_edit_message(progress, "✅ Аудио скачано\n🎛 Готовлю WAV (16kHz mono)…", reply_markup=markup)
                 ex0 = time.monotonic()
                 wav_path = await loop.run_in_executor(None, lambda: ap.extract_audio(src_path, output_dir=wav_dir))
+                _check_cancel()
                 session["audio"]["wav_path"] = os.path.basename(wav_path)
                 session["audio"]["wav_sec"] = round(_wav_duration_sec(wav_path), 3)
                 session["timings"]["extract_wav_sec"] = round(time.monotonic() - ex0, 3)
 
-                await _safe_edit(
+                await _safe_edit_message(
                     progress,
                     "✅ WAV готов\n"
                     f"🧠 Whisper ({whisper_model}) — распознаю…\n"
                     "(первый запуск может качать модель; для скорости beam_size=1)",
+                    reply_markup=markup,
                 )
                 cpu_threads = int((os.environ.get("WHISPER_CPU_THREADS") or "").strip() or "0")
                 whisper = TranscriptionService(
@@ -1871,22 +1916,47 @@ async def _process_audio(
                             chat_id=chat_id,
                             message=progress,
                             base_text=f"🧠 Whisper ({whisper_model}) — распознаю…",
+                            reply_markup=markup,
                             state=whisper_state,
+                            cancel_event=cancel_event,
                         )
                     )
                 try:
-                    whisper_timeout = int((os.environ.get("WHISPER_TIMEOUT_SEC") or "").strip() or "240")
+                    audio_sec0 = float(getattr(whisper_state, "audio_sec", 0.0) or 0.0) if whisper_state else 0.0
+                    whisper_timeout_env = _parse_timeout_env("WHISPER_TIMEOUT_SEC")
+                    if whisper_timeout_env is None:
+                        whisper_timeout = _default_whisper_timeout_sec(audio_sec=audio_sec0)
+                    else:
+                        whisper_timeout = float(whisper_timeout_env)
                     w0 = time.monotonic()
-                    w_segments, _w_info = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            None,
-                            lambda: whisper.transcribe(
-                                wav_path,
-                                progress_cb=(whisper_state.set_processed_sec if whisper_state else None),
-                            ),
-                        ),
-                        timeout=float(max(10, whisper_timeout)),
-                    )
+                    try:
+                        if whisper_timeout <= 0:
+                            w_segments, _w_info = await loop.run_in_executor(
+                                None,
+                                lambda: whisper.transcribe(
+                                    wav_path,
+                                    progress_cb=(whisper_state.set_processed_sec if whisper_state else None),
+                                ),
+                            )
+                        else:
+                            w_segments, _w_info = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    None,
+                                    lambda: whisper.transcribe(
+                                        wav_path,
+                                        progress_cb=(whisper_state.set_processed_sec if whisper_state else None),
+                                    ),
+                                ),
+                                timeout=float(max(10.0, whisper_timeout)),
+                            )
+                    except asyncio.TimeoutError as exc:
+                        w_wall = time.monotonic() - w0
+                        session["timings"]["whisper_sec"] = round(w_wall, 3)
+                        raise RuntimeError(
+                            "Whisper не успел завершить распознавание и был остановлен по таймауту.\n"
+                            f"Время: {_fmt_dur(w_wall)} / лимит: {_fmt_dur(float(whisper_timeout))}.\n"
+                            "Увеличьте `WHISPER_TIMEOUT_SEC` (например, 3600) или отключите таймаут: `WHISPER_TIMEOUT_SEC=0`."
+                        ) from exc
                     w_wall = time.monotonic() - w0
                     if whisper_state and whisper_state.audio_sec > 0:
                         _update_rtf_est("whisper", w_wall / whisper_state.audio_sec)
@@ -1898,16 +1968,18 @@ async def _process_audio(
                             await ticker_task
                         except Exception:
                             pass
+                _check_cancel()
                 w_text = " ".join((s.text or "").strip() for s in w_segments if (s.text or "").strip()).strip()
                 session["results"] = {
                     "whisper_len": len(w_text),
                     "whisper_segments": len(w_segments or []),
                 }
-                await _safe_edit(
+                await _safe_edit_message(
                     progress,
                     "✅ Whisper готов\n"
                     f"🧠 GigaAM ({gigaam_model}) — распознаю…\n"
                     "(первый запуск может качать веса)",
+                    reply_markup=markup,
                 )
 
                 giga = GigaAMTranscriptionService(model_name=gigaam_model, device=device, hf_token=hf_token)
@@ -1922,7 +1994,9 @@ async def _process_audio(
                             chat_id=chat_id,
                             message=progress,
                             base_text=f"🧠 GigaAM ({gigaam_model}) — распознаю…",
+                            reply_markup=markup,
                             state=giga_state,
+                            cancel_event=cancel_event,
                         )
                     )
                 try:
@@ -1941,6 +2015,7 @@ async def _process_audio(
                             await ticker_task
                         except Exception:
                             pass
+                _check_cancel()
                 g_text = " ".join((s.text or "").strip() for s in g_segments if (s.text or "").strip()).strip()
                 session["results"].update(
                     {
@@ -1954,25 +2029,17 @@ async def _process_audio(
                 )
                 session["results"]["transcripts_exceed_single_message"] = transcripts_exceed_single_message
                 if transcripts_exceed_single_message:
-                    await _safe_edit(
+                    await _safe_edit_message(
                         progress,
                         "ℹ️ Текст распознавания слишком длинный для одного сообщения.\n"
                         "Итог и обе транскрибации пришлю только файлом…",
+                        reply_markup=markup,
                     )
                 else:
                     await _safe_delete(progress)
                     progress = None
                     await _reply_long(update, f"Whisper:\n{w_text or '(пусто)'}")
                     await _reply_long(update, f"GigaAM:\n{g_text or '(пусто)'}")
-
-                if update.effective_chat and update.effective_user:
-                    _set_last_transcripts(
-                        context,
-                        chat_id=int(update.effective_chat.id),
-                        user_id=int(update.effective_user.id),
-                        whisper_text=w_text,
-                        gigaam_text=g_text,
-                    )
 
                 final_text = ""
                 final_error = ""
@@ -1987,10 +2054,17 @@ async def _process_audio(
 
                 if chat_id is not None:
                     await _safe_delete(progress)
+                    _check_cancel()
+
+                    llm_sem: asyncio.Semaphore = context.application.bot_data.setdefault(
+                        "llm_semaphore", asyncio.Semaphore(_llm_concurrency())
+                    )
 
                     if can_use_gemini and gemini_api_key:
                         final_label = f"Gemini ({gemini_model})"
-                        progress = await reply_target.reply_text(f"🧠 {final_label} — думаю над итогом…")
+                        progress = await reply_target.reply_text(
+                            f"🧠 {final_label} — жду очередь…", reply_markup=markup
+                        )
                         gmi0 = time.monotonic()
 
                         async def on_update(thoughts: str, elapsed_sec: float) -> None:
@@ -2001,7 +2075,7 @@ async def _process_audio(
                                 f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
                                 f"{body_html}"
                             )
-                            await _safe_edit_formatted(progress, text_html, parse_mode=ParseMode.HTML)
+                            await _safe_edit_message(progress, text_html, parse_mode=ParseMode.HTML, reply_markup=markup)
                             try:
                                 await context.bot.send_chat_action(chat_id=int(chat_id), action=ChatAction.TYPING)
                             except Exception:
@@ -2021,14 +2095,19 @@ async def _process_audio(
                         }
 
                         try:
-                            final_text = await _gemini_stream_generate(
-                                api_key=gemini_api_key,
-                                model=gemini_model,
-                                prompt=user_prompt,
-                                system_prompt=gemini_system_prompt,
-                                generation_config=generation_config,
-                                on_update=on_update,
-                            )
+                            async with llm_sem:
+                                await _safe_edit_message(
+                                    progress, f"🧠 {final_label} — думаю над итогом…", reply_markup=markup
+                                )
+                                final_text = await _gemini_stream_generate(
+                                    api_key=gemini_api_key,
+                                    model=gemini_model,
+                                    prompt=user_prompt,
+                                    system_prompt=gemini_system_prompt,
+                                    generation_config=generation_config,
+                                    on_update=on_update,
+                                    cancel_event=cancel_event,
+                                )
                         except Exception as exc:
                             logging.getLogger("local_telegram_bot").exception("Gemini default processing failed")
                             final_error = str(exc)
@@ -2039,7 +2118,9 @@ async def _process_audio(
                     else:
                         local_model = _ollama_model()
                         final_label = f"Local ({local_model})"
-                        progress = await reply_target.reply_text(f"🧠 {final_label} — думаю над итогом…")
+                        progress = await reply_target.reply_text(
+                            f"🧠 {final_label} — жду очередь…", reply_markup=markup
+                        )
                         llm0 = time.monotonic()
 
                         async def on_update(thoughts: str, elapsed_sec: float) -> None:
@@ -2050,19 +2131,24 @@ async def _process_audio(
                                 f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
                                 f"{body_html}"
                             )
-                            await _safe_edit_formatted(progress, text_html, parse_mode=ParseMode.HTML)
+                            await _safe_edit_message(progress, text_html, parse_mode=ParseMode.HTML, reply_markup=markup)
                             try:
                                 await context.bot.send_chat_action(chat_id=int(chat_id), action=ChatAction.TYPING)
                             except Exception:
                                 pass
 
                         try:
-                            final_text = await _ollama_stream_generate(
-                                model=local_model,
-                                prompt=user_prompt,
-                                system_prompt=gemini_system_prompt,
-                                on_update=on_update,
-                            )
+                            async with llm_sem:
+                                await _safe_edit_message(
+                                    progress, f"🧠 {final_label} — думаю над итогом…", reply_markup=markup
+                                )
+                                final_text = await _ollama_stream_generate(
+                                    model=local_model,
+                                    prompt=user_prompt,
+                                    system_prompt=gemini_system_prompt,
+                                    on_update=on_update,
+                                    cancel_event=cancel_event,
+                                )
                         except Exception as exc:
                             logging.getLogger("local_telegram_bot").exception("Local LLM processing failed")
                             final_error = str(exc)
@@ -2075,7 +2161,7 @@ async def _process_audio(
                     final_label = "LLM"
 
                 if progress:
-                    await _safe_edit(progress, "📄 Формирую итоговый файл…")
+                    await _safe_edit_message(progress, "📄 Формирую итоговый файл…", reply_markup=markup)
 
                 if final_text and not transcripts_exceed_single_message:
                     chat_text = _gemini_chat_excerpt(final_text)
@@ -2111,12 +2197,24 @@ async def _process_audio(
                 await _safe_delete(progress)
                 await reply_target.reply_text("✅ Готово")
                 session["status"] = "ok"
+        except _UserCancelled:
+            session["status"] = "canceled"
+            session["error"] = "canceled_by_user"
+            try:
+                await _safe_edit_message(progress, "⛔️ Отменено пользователем.", reply_markup=None)
+            except Exception:
+                pass
         except Exception as exc:
             logging.exception("ASR failed")
-            await reply_target.reply_text(f"Ошибка: {exc}")
+            err = str(exc).strip() or exc.__class__.__name__
+            await reply_target.reply_text(f"Ошибка: {err}")
             session["status"] = "error"
-            session["error"] = str(exc)
+            session["error"] = err
         finally:
+            try:
+                _active_sessions(context).pop(session_id, None)
+            except Exception:
+                pass
             session["ended_at"] = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
             session["timings"] = session.get("timings") or {}
             session["timings"]["total_sec"] = round(time.monotonic() - t0, 3)
@@ -2144,7 +2242,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     return
 
-    sem: asyncio.Semaphore = context.application.bot_data.setdefault("asr_semaphore", asyncio.Semaphore(1))
+    sem: asyncio.Semaphore = context.application.bot_data.setdefault(
+        "asr_semaphore", asyncio.Semaphore(_asr_concurrency())
+    )
     async with sem:
         try:
             whisper_model = _get_env("WHISPER_MODEL", "medium")
@@ -2154,7 +2254,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             hf_token: Optional[str] = (os.environ.get("HF_TOKEN") or "").strip() or None
             gemini_api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
             gemini_model = (os.environ.get("GEMINI_MODEL") or "gemini-3-pro-preview").strip()
-            gemini_system_prompt = (os.environ.get("GEMINI_SYSTEM_PROMPT") or "").strip() or DEFAULT_GEMINI_SYSTEM_PROMPT
+            gemini_system_prompt, _prompt_src = _get_system_prompt()
 
             # Single "status/progress" message. It is recreated between stages so it's always below previously sent text.
             progress = await update.effective_message.reply_text("Старт…")
@@ -2268,16 +2368,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                             pass
                 g_text = " ".join((s.text or "").strip() for s in g_segments if (s.text or "").strip()).strip()
                 await _reply_long(update, f"GigaAM:\n{g_text or '(пусто)'}")
-
-                # Store for /process and later use.
-                if update.effective_chat and update.effective_user:
-                    _set_last_transcripts(
-                        context,
-                        chat_id=int(update.effective_chat.id),
-                        user_id=int(update.effective_user.id),
-                        whisper_text=w_text,
-                        gigaam_text=g_text,
-                    )
 
                 # Gemini post-processing (default pipeline) → markdown file.
                 gemini_text = ""
@@ -2400,7 +2490,14 @@ def main() -> None:
         except Exception:
             logging.getLogger("local_telegram_bot").exception("Failed to fetch bot username via getMe()")
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    builder = Application.builder().token(token).post_init(post_init)
+    try:
+        cu = _bot_concurrent_updates()
+        builder = builder.concurrent_updates(cu)
+        logging.getLogger("local_telegram_bot").info("Bot concurrent updates: %s", cu)
+    except Exception:
+        logging.getLogger("local_telegram_bot").exception("Failed to enable concurrent updates; falling back to sequential.")
+    app = builder.build()
 
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         err = context.error
@@ -2409,9 +2506,7 @@ def main() -> None:
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("auth", cmd_auth))
-    app.add_handler(CommandHandler("models", cmd_models))
-    app.add_handler(CommandHandler("process", cmd_process))
-    app.add_handler(CommandHandler("obrabotat", cmd_process))
+    app.add_handler(CallbackQueryHandler(cb_cancel, pattern=r"^cancel:"))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & filters.REPLY, handle_group_tag))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_process_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, handle_audio))

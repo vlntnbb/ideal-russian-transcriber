@@ -1051,17 +1051,9 @@ async def _process_audio(
                     session["status"] = "error"
                     session["error"] = "telegram_get_file_too_big"
                     await _safe_delete(progress)
-                    size_hint = ""
-                    if source_file_size:
-                        size_mb = source_file_size / (1024 * 1024)
-                        size_hint = f" ({size_mb:.1f}MB)"
                     await reply_target.reply_text(
-                        "Ошибка: Telegram Bot API не даёт скачать этот файл"
-                        f"{size_hint} (File is too big).\n\n"
-                        "Варианты:\n"
-                        "1) Перешлите/отправьте то же аудио как voice (ogg/opus) — обычно сильно меньше.\n"
-                        "2) Сожмите/обрежьте файл так, чтобы он был < ~20MB.\n"
-                        "3) Пришлите ссылку на файл (Google Drive/Dropbox/и т.п.) — тогда можно будет добавить поддержку скачивания по URL."
+                        "Ошибка: Telegram API не даёт скачать этот файл (File is too big). "
+                        "Отправьте более короткое аудио или сожмите/обрежьте файл."
                     )
                     return
                 raise

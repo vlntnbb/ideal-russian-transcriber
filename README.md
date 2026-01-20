@@ -51,7 +51,14 @@ python3 local_telegram_bot.py
 Telegram Bot API может не позволить боту скачать слишком большой voice/audio файл (`File is too big`).
 Лимит пред-проверки настраивается через `TELEGRAM_MAX_GET_FILE_MB` (по умолчанию `20`).
 
-Если нужно обрабатывать большие файлы, самый надёжный вариант — **самостоятельно поднять Telegram Bot API server** (`telegram-bot-api`) и указать:
+Важно: даже при self-hosted `telegram-bot-api` Telegram **может** возвращать `File is too big` — это ограничение Bot API для некоторых файлов.
+
+Если нужно обрабатывать большие аудио, варианты:
+- отправлять аудио как voice (ogg/opus) — обычно существенно меньше
+- сжимать/обрезать до < ~20MB
+- отправлять ссылку на файл (можно добавить поддержку скачивания по URL)
+
+Self-hosted `telegram-bot-api` полезен как отдельная инфраструктура и для local-mode, и его можно подключить так:
 - `TELEGRAM_API_BASE_URL`
 - `TELEGRAM_FILE_BASE_URL`
 - `TELEGRAM_LOCAL_MODE=1`

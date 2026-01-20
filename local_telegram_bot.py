@@ -13,6 +13,7 @@ import sys
 import warnings
 import uuid
 import html as _html
+import re
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -569,6 +570,95 @@ def _markdown_bold_lines_to_html(text: str) -> str:
     return "\n".join(out_lines).strip()
 
 
+def _markdown_to_telegram_html(text: str) -> str:
+    """
+    Minimal Markdown -> Telegram HTML:
+    - Headings like '### Title' become bold lines.
+    - Inline **bold** becomes <b>bold</b> (within a single line).
+    Everything else is HTML-escaped.
+    """
+
+    def md_line_to_html(line: str) -> str:
+        raw = line.rstrip("\n")
+        stripped = raw.strip()
+
+        # Headings: "#", "##", ... "######"
+        m = re.match(r"^(#{1,6})\\s+(.*)$", stripped)
+        if m:
+            title = m.group(2).strip()
+            return f"<b>{_html.escape(title)}</b>"
+
+        # Inline bold: **...** (same line only)
+        parts = raw.split("**")
+        # Even length => unmatched ** markers; keep as plain text.
+        if len(parts) >= 3 and (len(parts) % 2 == 1):
+            out = []
+            for i, part in enumerate(parts):
+                if i % 2 == 1:
+                    out.append(f"<b>{_html.escape(part)}</b>")
+                else:
+                    out.append(_html.escape(part))
+            return "".join(out)
+
+        return _html.escape(raw)
+
+    lines = (text or "").splitlines()
+    return "\n".join(md_line_to_html(line) for line in lines).strip()
+
+
+def _split_html_for_telegram(html_text: str, *, limit: int = TELEGRAM_TEXT_LIMIT - 50):
+    """
+    Splits HTML text into chunks that Telegram can accept, trying to avoid
+    cutting inside tags and keeping <b> tags balanced across chunks.
+    """
+    s = (html_text or "").strip()
+    if not s:
+        return
+
+    open_bold = False
+    while s:
+        if len(s) <= limit:
+            chunk = s
+            s = ""
+        else:
+            # Prefer cutting at a newline or space before the limit.
+            cut = max(s.rfind("\n", 0, limit), s.rfind(" ", 0, limit))
+            if cut <= 0:
+                cut = limit
+
+            # Avoid cutting inside an HTML tag.
+            sub = s[:cut]
+            lt = sub.rfind("<")
+            gt = sub.rfind(">")
+            if lt > gt:
+                # We're inside a tag; back up to before the tag.
+                cut = lt
+                if cut <= 0:
+                    cut = limit
+
+            chunk = s[:cut].rstrip()
+            s = s[cut:].lstrip()
+
+        # Track bold tag state and balance within the chunk.
+        opens = chunk.count("<b>")
+        closes = chunk.count("</b>")
+        if open_bold:
+            chunk = "<b>" + chunk
+            open_bold = False
+            opens += 1
+        if opens > closes:
+            open_bold = True
+            chunk = chunk + "</b>"
+
+        if chunk.strip():
+            yield chunk
+
+
+async def _reply_long_html(update: Update, html_text: str) -> None:
+    for part in _split_html_for_telegram(html_text):
+        await update.effective_message.reply_text(part, parse_mode=ParseMode.HTML)
+
+
 def _gemini_chat_excerpt(text: str) -> str:
     """
     For chat output, show only the final text section (before notes/actions).
@@ -765,7 +855,8 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 on_update=on_update,
             )
             await _safe_delete(status)
-            await _reply_long(update, out or "(пусто)")
+            out = out or "(пусто)"
+            await _reply_long_html(update, _markdown_to_telegram_html(out))
         except Exception as exc:
             logging.getLogger("local_telegram_bot").exception("Gemini failed")
             await _safe_delete(status)
@@ -1132,7 +1223,7 @@ async def _process_audio(
                 if gemini_text and not transcripts_exceed_single_message:
                     chat_text = _gemini_chat_excerpt(gemini_text)
                     if chat_text.strip():
-                        await _reply_long(update, chat_text.strip())
+                        await _reply_long_html(update, _markdown_to_telegram_html(chat_text.strip()))
                 elif gemini_error:
                     await reply_target.reply_text(f"Gemini: ошибка/пропуск: {gemini_error}")
 
@@ -1384,7 +1475,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 # Also send the final Gemini block as a chat message (then the file).
                 if gemini_text:
-                    await _reply_long(update, gemini_text.strip())
+                    chat_text = _gemini_chat_excerpt(gemini_text)
+                    if chat_text.strip():
+                        await _reply_long_html(update, _markdown_to_telegram_html(chat_text.strip()))
                 elif gemini_error:
                     await update.effective_message.reply_text(f"Gemini: ошибка/пропуск: {gemini_error}")
 

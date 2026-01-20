@@ -19,7 +19,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction, ChatType, ParseMode
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import httpx
 
@@ -342,21 +342,33 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 def _pick_telegram_file(update: Update):
     msg = update.effective_message
     if msg is None:
-        return None, None
+        return None, None, None
     return _pick_telegram_file_from_message(msg)
 
 
 def _pick_telegram_file_from_message(msg):
     if msg.voice:
-        return msg.voice.file_id, "voice.ogg"
+        return msg.voice.file_id, "voice.ogg", msg.voice.file_size
     if msg.audio:
         name = msg.audio.file_name or "audio"
-        return msg.audio.file_id, name
+        return msg.audio.file_id, name, msg.audio.file_size
     if msg.document and (msg.document.mime_type or "").startswith("audio/"):
         name = msg.document.file_name or "audio.bin"
-        return msg.document.file_id, name
+        return msg.document.file_id, name, msg.document.file_size
 
-    return None, None
+    return None, None, None
+
+
+def _telegram_max_get_file_bytes() -> int:
+    """
+    Telegram Bot API download limit precheck (in MB).
+    Set TELEGRAM_MAX_GET_FILE_MB=0 to disable precheck.
+    """
+    raw = (os.environ.get("TELEGRAM_MAX_GET_FILE_MB") or "").strip()
+    mb = int(raw or "20")
+    if mb <= 0:
+        return 0
+    return mb * 1024 * 1024
 
 
 async def _send_transcript_file(update: Update, *, whisper_text: str, gigaam_text: str) -> None:
@@ -932,7 +944,7 @@ async def handle_group_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception:
         pass
 
-    file_id, filename = _pick_telegram_file_from_message(replied)
+    file_id, filename, file_size = _pick_telegram_file_from_message(replied)
     if not file_id:
         await msg.reply_text("Ответьте на voice/audio сообщение и упомяните меня (@...).")
         return
@@ -944,6 +956,7 @@ async def handle_group_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         filename=filename or "audio",
         reply_target=msg,
         source_message_id=getattr(replied, "message_id", None),
+        source_file_size=file_size,
     )
 
 
@@ -955,6 +968,7 @@ async def _process_audio(
     filename: str,
     reply_target,
     source_message_id: Optional[int] = None,
+    source_file_size: Optional[int] = None,
 ) -> None:
     """
     Core pipeline used by both private chats (direct voice/audio)
@@ -990,7 +1004,7 @@ async def _process_audio(
                 or getattr(reply_target, "message_id", None)
                 or getattr(req_msg, "message_id", None),
             },
-            "audio": {"file_id": file_id, "filename": filename},
+            "audio": {"file_id": file_id, "filename": filename, "file_size": source_file_size},
             "status": "started",
         }
         try:
@@ -1016,7 +1030,37 @@ async def _process_audio(
             chat_id = int(update.effective_chat.id) if update.effective_chat else None
 
             await _safe_edit(progress, "📥 Скачиваю аудио…")
-            tg_file = await context.bot.get_file(file_id)
+            max_bytes = _telegram_max_get_file_bytes()
+            if max_bytes and source_file_size and source_file_size > max_bytes:
+                size_mb = source_file_size / (1024 * 1024)
+                limit_mb = max_bytes / (1024 * 1024)
+                session["status"] = "error"
+                session["error"] = f"incoming_file_too_big({size_mb:.1f}MB>{limit_mb:.0f}MB)"
+                await _safe_delete(progress)
+                await reply_target.reply_text(
+                    f"Ошибка: файл слишком большой для скачивания ботом через Telegram API "
+                    f"({size_mb:.1f}MB, лимит ~{limit_mb:.0f}MB). "
+                    f"Сожмите файл, чтобы он удовлетворял этому ограничению и отправьте снова."
+                )
+                return
+
+            try:
+                tg_file = await context.bot.get_file(file_id)
+            except BadRequest as exc:
+                if "file is too big" in str(exc).lower():
+                    size_mb = (source_file_size or 0) / (1024 * 1024)
+                    max_bytes = _telegram_max_get_file_bytes()
+                    limit_mb = (max_bytes / (1024 * 1024)) if max_bytes else 20
+                    session["status"] = "error"
+                    session["error"] = "telegram_get_file_too_big"
+                    await _safe_delete(progress)
+                    await reply_target.reply_text(
+                        f"Ошибка: файл слишком большой для скачивания ботом через Telegram API "
+                        f"({size_mb:.1f}MB, лимит ~{limit_mb:.0f}MB). "
+                        f"Сожмите файл, чтобы он удовлетворял этому ограничению и отправьте снова."
+                    )
+                    return
+                raise
 
             with tempfile.TemporaryDirectory(prefix="tg_asr_") as td:
                 src_path = os.path.join(td, filename)
@@ -1269,13 +1313,21 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if _is_group_chat(update):
         return
 
-    file_id, filename = _pick_telegram_file(update)
+    file_id, filename, file_size = _pick_telegram_file(update)
     if not file_id:
         await update.effective_message.reply_text("Пришлите voice/audio файл.")
         return
 
     # Use the shared pipeline (also used by reply+mention in group chats).
-    await _process_audio(update, context, file_id=file_id, filename=filename or "audio", reply_target=update.effective_message)
+    await _process_audio(
+        update,
+        context,
+        file_id=file_id,
+        filename=filename or "audio",
+        reply_target=update.effective_message,
+        source_message_id=getattr(update.effective_message, "message_id", None),
+        source_file_size=file_size,
+    )
     return
 
     sem: asyncio.Semaphore = context.application.bot_data.setdefault("asr_semaphore", asyncio.Semaphore(1))

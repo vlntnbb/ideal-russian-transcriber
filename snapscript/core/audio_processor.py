@@ -18,6 +18,10 @@ class ASRSegment:
     text: str
 
 
+class TranscriptionCancelled(Exception):
+    pass
+
+
 def _wav_duration_sec(wav_path: str) -> float:
     try:
         with wave.open(wav_path, "rb") as wf:
@@ -151,12 +155,15 @@ class TranscriptionService:
         wav_path: str,
         *,
         progress_cb=None,
+        cancel_cb=None,
     ) -> Tuple[List[ASRSegment], Dict[str, object]]:
         self._progress_cb = progress_cb
+        self._cancel_cb = cancel_cb
         try:
             return self._transcribe_impl(wav_path)
         finally:
             self._progress_cb = None
+            self._cancel_cb = None
 
     def _transcribe_impl(self, wav_path: str) -> Tuple[List[ASRSegment], Dict[str, object]]:
         t0 = time.monotonic()
@@ -193,6 +200,15 @@ class TranscriptionService:
         )
         segments: List[ASRSegment] = []
         for s in segments_iter:
+            try:
+                cancel = getattr(self, "_cancel_cb", None)
+                if cancel and cancel():
+                    self.logger.info("Whisper transcribe canceled by user")
+                    raise TranscriptionCancelled()
+            except TranscriptionCancelled:
+                raise
+            except Exception:
+                pass
             seg = ASRSegment(start=float(s.start), end=float(s.end), text=str(s.text))
             segments.append(seg)
             # Progress callback (called from worker thread)

@@ -18,6 +18,7 @@ import secrets
 import smtplib
 import ssl
 import subprocess
+import threading
 from email.message import EmailMessage
 from typing import Optional
 
@@ -28,7 +29,12 @@ from telegram.error import BadRequest, RetryAfter
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 import httpx
 
-from snapscript.core.audio_processor import AudioProcessor, GigaAMTranscriptionService, TranscriptionService
+from snapscript.core.audio_processor import (
+    AudioProcessor,
+    GigaAMTranscriptionService,
+    TranscriptionCancelled,
+    TranscriptionService,
+)
 from snapscript.utils.logging_utils import setup_logging
 
 # Prevent multiple polling instances in the same repo (avoids Telegram getUpdates Conflict).
@@ -1970,6 +1976,16 @@ async def _process_audio(
                     else:
                         whisper_timeout = float(whisper_timeout_env)
                     w0 = time.monotonic()
+                    cancel_thread_event = threading.Event()
+
+                    async def _mirror_cancel_to_thread() -> None:
+                        try:
+                            await cancel_event.wait()
+                            cancel_thread_event.set()
+                        except Exception:
+                            pass
+
+                    mirror_task = asyncio.create_task(_mirror_cancel_to_thread())
                     try:
                         if whisper_timeout <= 0:
                             w_segments, _w_info = await loop.run_in_executor(
@@ -1977,6 +1993,7 @@ async def _process_audio(
                                 lambda: whisper.transcribe(
                                     wav_path,
                                     progress_cb=(whisper_state.set_processed_sec if whisper_state else None),
+                                    cancel_cb=cancel_thread_event.is_set,
                                 ),
                             )
                         else:
@@ -1986,10 +2003,13 @@ async def _process_audio(
                                     lambda: whisper.transcribe(
                                         wav_path,
                                         progress_cb=(whisper_state.set_processed_sec if whisper_state else None),
+                                        cancel_cb=cancel_thread_event.is_set,
                                     ),
                                 ),
                                 timeout=float(max(10.0, whisper_timeout)),
                             )
+                    except TranscriptionCancelled:
+                        raise _UserCancelled()
                     except asyncio.TimeoutError as exc:
                         w_wall = time.monotonic() - w0
                         session["timings"]["whisper_sec"] = round(w_wall, 3)
@@ -1998,6 +2018,11 @@ async def _process_audio(
                             f"Время: {_fmt_dur(w_wall)} / лимит: {_fmt_dur(float(whisper_timeout))}.\n"
                             "Увеличьте `WHISPER_TIMEOUT_SEC` (например, 3600) или отключите таймаут: `WHISPER_TIMEOUT_SEC=0`."
                         ) from exc
+                    finally:
+                        try:
+                            mirror_task.cancel()
+                        except Exception:
+                            pass
                     w_wall = time.monotonic() - w0
                     if whisper_state and whisper_state.audio_sec > 0:
                         _update_rtf_est("whisper", w_wall / whisper_state.audio_sec)

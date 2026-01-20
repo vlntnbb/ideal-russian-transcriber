@@ -11,6 +11,7 @@ import io
 import datetime
 import sys
 import warnings
+import uuid
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -42,6 +43,9 @@ def _acquire_bot_lock(lock_path: str) -> None:
 TELEGRAM_TEXT_LIMIT = 4096
 STATS_PATH = os.path.join(os.path.dirname(__file__), "asr_stats.json")
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_USAGE_LOG_PATH = os.path.join(os.path.dirname(__file__), "usage_sessions.jsonl")
+
+_USAGE_LOGGER: Optional[logging.Logger] = None
 
 DEFAULT_GEMINI_SYSTEM_PROMPT = """\
 вот две транскрибации одного аудио двумя разными моделями. они косячат в разных местах. твоя задача сделать итоговый текст, взяв из каждой модели пропущенные предложения и исправив явные ошибки и убрав повторы. когда какие-то слова будут отличаться выбирай тот вариант, который из контекста выглядит более правильным. если в обоих случаях текст выглядит как с ошибками - исправь исходя из контекста. ни в коем случае не выкидывай никакие смысловые фразы и предложения, тебе нужно соблюсти точность передачи текста. подсвети жирным те части текста, где тебе пришлось исправлять текст (где он отличается между моделями).
@@ -67,6 +71,54 @@ def _fmt_dur(sec: float) -> str:
         return f"{m}m{s:02d}s"
     h, m = divmod(m, 60)
     return f"{h}h{m:02d}m"
+
+
+def _truthy_env(name: str, default: bool = True) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off", "disabled"}
+
+
+def _setup_usage_logger() -> Optional[logging.Logger]:
+    """
+    Separate usage log for sessions (JSON Lines).
+    Does not include transcripts/prompts; only metadata and timings.
+    """
+    global _USAGE_LOGGER
+    if _USAGE_LOGGER is not None:
+        return _USAGE_LOGGER
+
+    if not _truthy_env("USAGE_LOG_ENABLED", True):
+        _USAGE_LOGGER = None
+        return None
+
+    path = (os.environ.get("USAGE_LOG_PATH") or "").strip() or DEFAULT_USAGE_LOG_PATH
+    try:
+        logger = logging.getLogger("usage_sessions")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+        _USAGE_LOGGER = logger
+        logging.getLogger("local_telegram_bot").info("Usage log enabled: %s", path)
+        return logger
+    except Exception:
+        logging.getLogger("local_telegram_bot").exception("Failed to set up usage logger")
+        _USAGE_LOGGER = None
+        return None
+
+
+def _log_usage_session(payload: dict) -> None:
+    logger = _USAGE_LOGGER or logging.getLogger("usage_sessions")
+    if not logger.handlers:
+        return
+    try:
+        logger.info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        # Usage logging must never break bot flow.
+        pass
 
 
 def _wav_duration_sec(wav_path: str) -> float:
@@ -761,7 +813,14 @@ async def handle_group_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await msg.reply_text("Ответьте на voice/audio сообщение и упомяните меня (@...).")
         return
 
-    await _process_audio(update, context, file_id=file_id, filename=filename or "audio", reply_target=msg)
+    await _process_audio(
+        update,
+        context,
+        file_id=file_id,
+        filename=filename or "audio",
+        reply_target=msg,
+        source_message_id=getattr(replied, "message_id", None),
+    )
 
 
 async def _process_audio(
@@ -771,6 +830,7 @@ async def _process_audio(
     file_id: str,
     filename: str,
     reply_target,
+    source_message_id: Optional[int] = None,
 ) -> None:
     """
     Core pipeline used by both private chats (direct voice/audio)
@@ -778,6 +838,37 @@ async def _process_audio(
     """
     sem: asyncio.Semaphore = context.application.bot_data.setdefault("asr_semaphore", asyncio.Semaphore(1))
     async with sem:
+        session_id = uuid.uuid4().hex
+        started_at = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+        t0 = time.monotonic()
+        user = update.effective_user
+        chat = update.effective_chat
+        req_msg = update.effective_message
+        session: dict = {
+            "session_id": session_id,
+            "started_at": started_at,
+            "trigger": "group_mention" if _is_group_chat(update) else "private_audio",
+            "telegram": {
+                "user": {
+                    "id": getattr(user, "id", None),
+                    "username": getattr(user, "username", None),
+                    "first_name": getattr(user, "first_name", None),
+                    "last_name": getattr(user, "last_name", None),
+                    "language_code": getattr(user, "language_code", None),
+                },
+                "chat": {
+                    "id": getattr(chat, "id", None),
+                    "type": str(getattr(chat, "type", "") or ""),
+                    "title": getattr(chat, "title", None),
+                },
+                "request_message_id": getattr(reply_target, "message_id", None) or getattr(req_msg, "message_id", None),
+                "audio_message_id": source_message_id
+                or getattr(reply_target, "message_id", None)
+                or getattr(req_msg, "message_id", None),
+            },
+            "audio": {"file_id": file_id, "filename": filename},
+            "status": "started",
+        }
         try:
             whisper_model = _get_env("WHISPER_MODEL", "medium")
             gigaam_model = _get_env("GIGAAM_MODEL", "v3_e2e_rnnt")
@@ -787,6 +878,14 @@ async def _process_audio(
             gemini_api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
             gemini_model = (os.environ.get("GEMINI_MODEL") or "gemini-3-pro-preview").strip()
             gemini_system_prompt = (os.environ.get("GEMINI_SYSTEM_PROMPT") or "").strip() or DEFAULT_GEMINI_SYSTEM_PROMPT
+            session["models"] = {
+                "whisper": whisper_model,
+                "gigaam": gigaam_model,
+                "gemini": gemini_model if gemini_api_key else None,
+                "device": device,
+                "language": language,
+                "hf_token": bool(hf_token),
+            }
 
             # Single "status/progress" message. It is recreated between stages so it's always below previously sent text.
             progress = await reply_target.reply_text("Старт…")
@@ -799,13 +898,19 @@ async def _process_audio(
                 src_path = os.path.join(td, filename)
                 wav_dir = td
 
+                dl0 = time.monotonic()
                 await tg_file.download_to_drive(custom_path=src_path)
+                session["timings"] = {"download_sec": round(time.monotonic() - dl0, 3)}
 
                 ap = AudioProcessor()
                 loop = asyncio.get_running_loop()
 
                 await _safe_edit(progress, "✅ Аудио скачано\n🎛 Готовлю WAV (16kHz mono)…")
+                ex0 = time.monotonic()
                 wav_path = await loop.run_in_executor(None, lambda: ap.extract_audio(src_path, output_dir=wav_dir))
+                session["audio"]["wav_path"] = os.path.basename(wav_path)
+                session["audio"]["wav_sec"] = round(_wav_duration_sec(wav_path), 3)
+                session["timings"]["extract_wav_sec"] = round(time.monotonic() - ex0, 3)
 
                 await _safe_edit(
                     progress,
@@ -850,6 +955,7 @@ async def _process_audio(
                     w_wall = time.monotonic() - w0
                     if whisper_state and whisper_state.audio_sec > 0:
                         _update_rtf_est("whisper", w_wall / whisper_state.audio_sec)
+                    session["timings"]["whisper_sec"] = round(w_wall, 3)
                 finally:
                     if ticker_task:
                         ticker_task.cancel()
@@ -858,6 +964,10 @@ async def _process_audio(
                         except Exception:
                             pass
                 w_text = " ".join((s.text or "").strip() for s in w_segments if (s.text or "").strip()).strip()
+                session["results"] = {
+                    "whisper_len": len(w_text),
+                    "whisper_segments": len(w_segments or []),
+                }
                 await _safe_edit(
                     progress,
                     "✅ Whisper готов\n"
@@ -886,6 +996,9 @@ async def _process_audio(
                     g_wall = time.monotonic() - g0
                     if giga_state and giga_state.audio_sec > 0:
                         _update_rtf_est("gigaam", g_wall / giga_state.audio_sec)
+                    session["timings"]["gigaam_sec"] = round(g_wall, 3)
+                    if isinstance(_g_info, dict):
+                        session.setdefault("gigaam", {})["info"] = _g_info
                 finally:
                     if ticker_task:
                         ticker_task.cancel()
@@ -894,10 +1007,17 @@ async def _process_audio(
                         except Exception:
                             pass
                 g_text = " ".join((s.text or "").strip() for s in g_segments if (s.text or "").strip()).strip()
+                session["results"].update(
+                    {
+                        "gigaam_len": len(g_text),
+                        "gigaam_segments": len(g_segments or []),
+                    }
+                )
 
                 transcripts_exceed_single_message = (
                     len(w_text) > TELEGRAM_TEXT_LIMIT or len(g_text) > TELEGRAM_TEXT_LIMIT
                 )
+                session["results"]["transcripts_exceed_single_message"] = transcripts_exceed_single_message
                 if transcripts_exceed_single_message:
                     await _safe_edit(
                         progress,
@@ -924,6 +1044,7 @@ async def _process_audio(
                 if gemini_api_key and chat_id is not None:
                     await _safe_delete(progress)
                     progress = await reply_target.reply_text(f"🧠 Gemini ({gemini_model}) — думаю над итогом…")
+                    gmi0 = time.monotonic()
 
                     async def on_update(thoughts: str, elapsed_sec: float) -> None:
                         body = _trim_for_telegram(thoughts or "(пока без мыслей)")
@@ -966,6 +1087,8 @@ async def _process_audio(
                     except Exception as exc:
                         logging.getLogger("local_telegram_bot").exception("Gemini default processing failed")
                         gemini_error = str(exc)
+                    finally:
+                        session["timings"]["gemini_sec"] = round(time.monotonic() - gmi0, 3)
                 elif not gemini_api_key:
                     gemini_error = "GEMINI_API_KEY не задан — пропускаю обработку Gemini."
 
@@ -979,6 +1102,14 @@ async def _process_audio(
                 elif gemini_error:
                     await reply_target.reply_text(f"Gemini: ошибка/пропуск: {gemini_error}")
 
+                session["results"].update(
+                    {
+                        "gemini_used": bool(gemini_api_key),
+                        "gemini_error": gemini_error or None,
+                        "gemini_len": len(gemini_text or ""),
+                    }
+                )
+
                 await _send_markdown_file(
                     update,
                     gemini_text=gemini_text,
@@ -986,12 +1117,27 @@ async def _process_audio(
                     whisper_text=w_text,
                     gigaam_text=g_text,
                 )
+                session.setdefault("telegram", {}).update(
+                    {
+                        "sent_transcripts_to_chat": not transcripts_exceed_single_message,
+                        "sent_gemini_to_chat": bool(gemini_text) and not transcripts_exceed_single_message,
+                        "sent_markdown_file": True,
+                    }
+                )
 
                 await _safe_delete(progress)
                 await reply_target.reply_text("✅ Готово")
+                session["status"] = "ok"
         except Exception as exc:
             logging.exception("ASR failed")
             await reply_target.reply_text(f"Ошибка: {exc}")
+            session["status"] = "error"
+            session["error"] = str(exc)
+        finally:
+            session["ended_at"] = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+            session["timings"] = session.get("timings") or {}
+            session["timings"]["total_sec"] = round(time.monotonic() - t0, 3)
+            _log_usage_session(session)
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # In groups, process only via reply+mention flow to avoid accidental triggers/spam.
@@ -1237,6 +1383,7 @@ def main() -> None:
         pass
     warnings.filterwarnings("ignore", message=r"Module 'speechbrain\\.pretrained' was deprecated.*")
     setup_logging()
+    _setup_usage_logger()
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("snapscript").setLevel(logging.INFO)
 

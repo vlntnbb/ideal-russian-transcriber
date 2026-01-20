@@ -56,6 +56,26 @@ Telegram Bot API может не позволить боту скачать сл
 - `TELEGRAM_FILE_BASE_URL`
 - `TELEGRAM_LOCAL_MODE=1`
 
+#### Docker на том же хосте
+
+1) Получите `TELEGRAM_API_ID` и `TELEGRAM_API_HASH` на `https://my.telegram.org`
+2) Заполните их в `.env`
+3) Поднимите локальный Bot API:
+
+```bash
+docker compose -f docker-compose.telegram-bot-api.yml up -d
+```
+
+4) Добавьте в `.env`:
+
+```bash
+TELEGRAM_API_BASE_URL=http://127.0.0.1:8081/bot
+TELEGRAM_FILE_BASE_URL=http://127.0.0.1:8081/file/bot
+TELEGRAM_LOCAL_MODE=1
+```
+
+5) Перезапустите бота.
+
 ## Обработка транскрипций (Gemini)
 
 Бот хранит последнюю транскрипцию (Whisper + GigaAM) для каждого пользователя в чате.

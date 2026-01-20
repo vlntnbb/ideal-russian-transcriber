@@ -12,11 +12,12 @@ import datetime
 import sys
 import warnings
 import uuid
+import html as _html
 from typing import Optional
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.constants import ChatAction, ChatType
+from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import RetryAfter
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import httpx
@@ -231,6 +232,21 @@ async def _safe_edit(message, text: str) -> Optional[float]:
         return float(getattr(exc, "retry_after", 0) or 0) or 1.0
     except Exception:
         # Message can be deleted/edited too often/etc. Don't fail ASR because of UI.
+        return None
+
+
+async def _safe_edit_formatted(message, text: str, *, parse_mode: Optional[str] = None) -> Optional[float]:
+    """
+    Like `_safe_edit`, but allows setting `parse_mode` (HTML/MarkdownV2).
+    """
+    try:
+        if not message:
+            return None
+        await message.edit_text(text, parse_mode=parse_mode)
+        return None
+    except RetryAfter as exc:
+        return float(getattr(exc, "retry_after", 0) or 0) or 1.0
+    except Exception:
         return None
 
 
@@ -537,6 +553,22 @@ def _trim_for_telegram(text: str, *, limit: int = TELEGRAM_TEXT_LIMIT - 50) -> s
     return "…\n" + text[-limit:].lstrip()
 
 
+def _markdown_bold_lines_to_html(text: str) -> str:
+    """
+    Minimal Markdown -> HTML conversion for lines like "**Header**" so Telegram shows them bold.
+    Everything else is HTML-escaped (no other markdown is interpreted).
+    """
+    out_lines = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.startswith("**") and s.endswith("**") and len(s) >= 4 and s.count("**") == 2:
+            inner = s[2:-2].strip()
+            out_lines.append(f"<b>{_html.escape(inner)}</b>")
+        else:
+            out_lines.append(_html.escape(line))
+    return "\n".join(out_lines).strip()
+
+
 def _gemini_chat_excerpt(text: str) -> str:
     """
     For chat output, show only the final text section (before notes/actions).
@@ -712,12 +744,13 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     return
                 # Best-effort "live thoughts" UI; will be deleted when done.
                 body = _trim_for_telegram(thoughts or "(пока без мыслей)")
-                await _safe_edit(
-                    status,
-                    f"🧠 Gemini ({model}) — думаю…\n"
-                    f"⏱ {_fmt_dur(elapsed_sec)}\n\n"
-                    f"{body}",
+                body_html = _markdown_bold_lines_to_html(body)
+                text_html = (
+                    f"🧠 Gemini ({_html.escape(model)}) — думаю…\n"
+                    f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
+                    f"{body_html}"
                 )
+                await _safe_edit_formatted(status, text_html, parse_mode=ParseMode.HTML)
                 try:
                     await context.bot.send_chat_action(chat_id=int(update.effective_chat.id), action=ChatAction.TYPING)
                 except Exception:
@@ -1048,12 +1081,13 @@ async def _process_audio(
 
                     async def on_update(thoughts: str, elapsed_sec: float) -> None:
                         body = _trim_for_telegram(thoughts or "(пока без мыслей)")
-                        await _safe_edit(
-                            progress,
-                            f"🧠 Gemini ({gemini_model}) — думаю над итогом…\n"
-                            f"⏱ {_fmt_dur(elapsed_sec)}\n\n"
-                            f"{body}",
+                        body_html = _markdown_bold_lines_to_html(body)
+                        text_html = (
+                            f"🧠 Gemini ({_html.escape(gemini_model)}) — думаю над итогом…\n"
+                            f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
+                            f"{body_html}"
                         )
+                        await _safe_edit_formatted(progress, text_html, parse_mode=ParseMode.HTML)
                         try:
                             await context.bot.send_chat_action(chat_id=int(chat_id), action=ChatAction.TYPING)
                         except Exception:
@@ -1300,12 +1334,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                     async def on_update(thoughts: str, elapsed_sec: float) -> None:
                         body = _trim_for_telegram(thoughts or "(пока без мыслей)")
-                        await _safe_edit(
-                            progress,
-                            f"🧠 Gemini ({gemini_model}) — думаю над итогом…\n"
-                            f"⏱ {_fmt_dur(elapsed_sec)}\n\n"
-                            f"{body}",
+                        body_html = _markdown_bold_lines_to_html(body)
+                        text_html = (
+                            f"🧠 Gemini ({_html.escape(gemini_model)}) — думаю над итогом…\n"
+                            f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
+                            f"{body_html}"
                         )
+                        await _safe_edit_formatted(progress, text_html, parse_mode=ParseMode.HTML)
                         try:
                             await context.bot.send_chat_action(chat_id=int(chat_id), action=ChatAction.TYPING)
                         except Exception:

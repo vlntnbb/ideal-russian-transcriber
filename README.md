@@ -51,6 +51,11 @@ python3 local_telegram_bot.py
 Telegram Bot API может не позволить боту скачать слишком большой voice/audio файл (`File is too big`).
 Лимит пред-проверки настраивается через `TELEGRAM_MAX_GET_FILE_MB` (по умолчанию `20`).
 
+Если нужно обрабатывать большие файлы, самый надёжный вариант — **самостоятельно поднять Telegram Bot API server** (`telegram-bot-api`) и указать:
+- `TELEGRAM_API_BASE_URL`
+- `TELEGRAM_FILE_BASE_URL`
+- `TELEGRAM_LOCAL_MODE=1`
+
 ## Обработка транскрипций (Gemini)
 
 Бот хранит последнюю транскрипцию (Whisper + GigaAM) для каждого пользователя в чате.

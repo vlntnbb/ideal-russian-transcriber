@@ -368,10 +368,6 @@ def _telegram_max_get_file_bytes() -> int:
     return mb * 1024 * 1024
 
 
-def _telegram_local_mode_enabled() -> bool:
-    return _truthy_env("TELEGRAM_LOCAL_MODE", False)
-
-
 async def _send_transcript_file(update: Update, *, whisper_text: str, gigaam_text: str) -> None:
     msg = update.effective_message
     if msg is None:
@@ -1581,17 +1577,7 @@ def main() -> None:
         except Exception:
             logging.getLogger("local_telegram_bot").exception("Failed to fetch bot username via getMe()")
 
-    builder = Application.builder().token(token).post_init(post_init)
-    tg_base_url = (os.environ.get("TELEGRAM_API_BASE_URL") or "").strip()
-    tg_file_base_url = (os.environ.get("TELEGRAM_FILE_BASE_URL") or "").strip()
-    if tg_base_url:
-        builder = builder.base_url(tg_base_url)
-    if tg_file_base_url:
-        builder = builder.base_file_url(tg_file_base_url)
-    if _telegram_local_mode_enabled():
-        builder = builder.local_mode(True)
-
-    app = builder.build()
+    app = Application.builder().token(token).post_init(post_init).build()
 
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         err = context.error

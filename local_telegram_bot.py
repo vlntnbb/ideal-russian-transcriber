@@ -72,6 +72,8 @@ DEFAULT_AUTH_CODE_MAX_WORDS = 10
 # Open-source fallback model (Ollama).
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "deepseek-r1:8b"
+DEFAULT_AUDIO_NORMALIZE_KEY = "norm"
+DEFAULT_AUDIO_NORMALIZE_FILTER = "adeclick,dynaudnorm=f=500:g=11:p=0.95:m=20"
 
 _USAGE_LOGGER: Optional[logging.Logger] = None
 
@@ -114,6 +116,44 @@ def _get_system_prompt() -> tuple[str, str]:
     if env_prompt:
         return env_prompt, "env"
     return DEFAULT_GEMINI_SYSTEM_PROMPT.strip(), "default"
+
+
+def _audio_normalize_key_tokens() -> list[str]:
+    raw = (os.environ.get("AUDIO_NORMALIZE_KEY") or "").strip()
+    if not raw:
+        raw = DEFAULT_AUDIO_NORMALIZE_KEY
+    # Allow comma-separated keys.
+    return [t.strip().lower() for t in raw.split(",") if t.strip()]
+
+
+def _audio_normalize_filter() -> str:
+    return (os.environ.get("AUDIO_NORMALIZE_FILTER") or DEFAULT_AUDIO_NORMALIZE_FILTER).strip()
+
+
+def _should_normalize_audio(text: str, *, bot_username: Optional[str]) -> bool:
+    if not text or not bot_username:
+        return False
+    keys = _audio_normalize_key_tokens()
+    if not keys:
+        return False
+
+    # Find the bot mention and inspect tokens after it.
+    pattern = re.compile(rf"@{re.escape(bot_username)}\b(.*)$", re.IGNORECASE | re.DOTALL)
+    m = pattern.search(text)
+    if not m:
+        return False
+    tail = (m.group(1) or "").strip()
+    if not tail:
+        return False
+    for tok in re.split(r"\s+", tail):
+        tok = (tok or "").strip()
+        if not tok:
+            continue
+        tok = tok.strip(".,;:!?()[]{}<>\"'")
+        tok = tok.split("=", 1)[0].split(":", 1)[0].strip().lower()
+        if tok in keys:
+            return True
+    return False
 
 
 def _fmt_dur(sec: float) -> str:
@@ -1825,14 +1865,17 @@ async def handle_group_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not _text_mentions_bot(msg.text, bot_username=bot_username):
         return
 
+    normalize_audio = _should_normalize_audio(msg.text, bot_username=bot_username)
+
     try:
         ent_types = ",".join(sorted({(e.type or "") for e in (msg.entities or []) if e})) or "-"
         logging.getLogger("local_telegram_bot").info(
-            "Group tag triggered chat=%s msg=%s reply_to=%s entities=%s",
+            "Group tag triggered chat=%s msg=%s reply_to=%s entities=%s normalize_audio=%s",
             getattr(update.effective_chat, "id", None),
             getattr(msg, "message_id", None),
             getattr(replied, "message_id", None),
             ent_types,
+            "yes" if normalize_audio else "no",
         )
     except Exception:
         pass
@@ -1850,6 +1893,7 @@ async def handle_group_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reply_target=msg,
         source_message_id=getattr(replied, "message_id", None),
         source_file_size=file_size,
+        normalize_audio=normalize_audio,
     )
 
 
@@ -1862,6 +1906,7 @@ async def _process_audio(
     reply_target,
     source_message_id: Optional[int] = None,
     source_file_size: Optional[int] = None,
+    normalize_audio: bool = False,
 ) -> None:
     """
     Core pipeline used by both private chats (direct voice/audio)
@@ -1905,7 +1950,12 @@ async def _process_audio(
                 or getattr(reply_target, "message_id", None)
                 or getattr(req_msg, "message_id", None),
             },
-            "audio": {"file_id": file_id, "filename": filename, "file_size": source_file_size},
+            "audio": {
+                "file_id": file_id,
+                "filename": filename,
+                "file_size": source_file_size,
+                "normalize_audio": bool(normalize_audio),
+            },
             "status": "started",
         }
         try:
@@ -2006,9 +2056,24 @@ async def _process_audio(
                 ap = AudioProcessor()
                 loop = asyncio.get_running_loop()
 
-                await _safe_edit_message(progress, "✅ Аудио скачано\n🎛 Готовлю WAV (16kHz mono)…", reply_markup=markup)
+                if normalize_audio:
+                    await _safe_edit_message(
+                        progress,
+                        "✅ Аудио скачано\n🎚 Нормализую аудио и готовлю WAV (16kHz mono)…",
+                        reply_markup=markup,
+                    )
+                else:
+                    await _safe_edit_message(progress, "✅ Аудио скачано\n🎛 Готовлю WAV (16kHz mono)…", reply_markup=markup)
                 ex0 = time.monotonic()
-                wav_path = await loop.run_in_executor(None, lambda: ap.extract_audio(src_path, output_dir=wav_dir))
+                audio_filter = _audio_normalize_filter() if normalize_audio else None
+                if normalize_audio:
+                    try:
+                        logging.getLogger("local_telegram_bot").info("Audio normalize enabled (filter=%s)", audio_filter)
+                    except Exception:
+                        pass
+                wav_path = await loop.run_in_executor(
+                    None, lambda: ap.extract_audio(src_path, output_dir=wav_dir, audio_filter=audio_filter)
+                )
                 _check_cancel()
                 session["audio"]["wav_path"] = os.path.basename(wav_path)
                 session["audio"]["wav_sec"] = round(_wav_duration_sec(wav_path), 3)

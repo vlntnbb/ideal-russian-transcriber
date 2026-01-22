@@ -76,6 +76,7 @@ class AudioProcessor:
         *,
         sample_rate: int = 16000,
         channels: int = 1,
+        audio_filter: Optional[str] = None,
         output_dir: Optional[str] = None,
     ) -> str:
         if not media_path or not os.path.exists(media_path):
@@ -87,12 +88,10 @@ class AudioProcessor:
         fd, out_path = tempfile.mkstemp(prefix="asr_", suffix=".wav", dir=output_dir)
         os.close(fd)
 
-        cmd = [
-            self.ffmpeg_bin,
-            "-y",
-            "-i",
-            media_path,
-            "-vn",
+        cmd = [self.ffmpeg_bin, "-y", "-i", media_path, "-vn"]
+        if audio_filter and str(audio_filter).strip():
+            cmd += ["-af", str(audio_filter).strip()]
+        cmd += [
             "-ac",
             str(int(channels)),
             "-ar",

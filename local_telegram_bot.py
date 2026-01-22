@@ -72,7 +72,7 @@ DEFAULT_AUTH_CODE_MAX_WORDS = 10
 # Open-source fallback model (Ollama).
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "deepseek-r1:8b"
-DEFAULT_AUDIO_NORMALIZE_KEY = "norm"
+DEFAULT_AUDIO_NORMALIZE_KEY = "norm,норм"
 DEFAULT_AUDIO_NORMALIZE_FILTER = "adeclick,dynaudnorm=f=500:g=11:p=0.95:m=20"
 
 _USAGE_LOGGER: Optional[logging.Logger] = None
@@ -123,7 +123,13 @@ def _audio_normalize_key_tokens() -> list[str]:
     if not raw:
         raw = DEFAULT_AUDIO_NORMALIZE_KEY
     # Allow comma-separated keys.
-    return [t.strip().lower() for t in raw.split(",") if t.strip()]
+    keys = [t.strip().lower() for t in raw.split(",") if t.strip()]
+    # Convenience aliases: accept both "norm" and "норм".
+    if "norm" in keys and "норм" not in keys:
+        keys.append("норм")
+    if "норм" in keys and "norm" not in keys:
+        keys.append("norm")
+    return keys
 
 
 def _audio_normalize_filter() -> str:
@@ -709,6 +715,74 @@ def _active_sessions_summary_line(context: ContextTypes.DEFAULT_TYPE) -> str:
     # Genitive after "от":
     user_word = _ru_plural(users, "пользователя", "пользователей", "пользователей")
     return f"В процессе обработки {files} {file_word} от {users} {user_word}."
+
+
+def _encode_audio_preview_ffmpeg(
+    *,
+    ffmpeg_bin: str,
+    src_wav: str,
+    out_dir: str,
+    base_name: str = "processed_audio",
+) -> str:
+    """
+    Best-effort: encodes wav to a compact format for sending back to user.
+    Tries MP3 first, then OGG/Opus.
+    Returns output file path.
+    """
+    ffmpeg_bin = (ffmpeg_bin or "ffmpeg").strip() or "ffmpeg"
+    os.makedirs(out_dir, exist_ok=True)
+
+    mp3_path = os.path.join(out_dir, f"{base_name}.mp3")
+    cmd_mp3 = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        src_wav,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "64k",
+        mp3_path,
+    ]
+    r = subprocess.run(cmd_mp3, capture_output=True, text=True)
+    if r.returncode == 0 and os.path.exists(mp3_path):
+        return mp3_path
+
+    ogg_path = os.path.join(out_dir, f"{base_name}.ogg")
+    cmd_ogg = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        src_wav,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "32k",
+        "-vbr",
+        "on",
+        "-compression_level",
+        "10",
+        ogg_path,
+    ]
+    r2 = subprocess.run(cmd_ogg, capture_output=True, text=True)
+    if r2.returncode == 0 and os.path.exists(ogg_path):
+        return ogg_path
+
+    raise RuntimeError(
+        "Не удалось подготовить обработанное аудио для отправки.\n"
+        f"MP3 error: {(r.stderr or '').strip()}\n"
+        f"OGG error: {(r2.stderr or '').strip()}"
+    )
 
 
 async def _gigaam_transcribe_hard_cancel(
@@ -2079,13 +2153,64 @@ async def _process_audio(
                 session["audio"]["wav_sec"] = round(_wav_duration_sec(wav_path), 3)
                 session["timings"]["extract_wav_sec"] = round(time.monotonic() - ex0, 3)
 
-                await _safe_edit_message(
-                    progress,
-                    "✅ WAV готов\n"
-                    f"🧠 Whisper ({whisper_model}) — распознаю…\n"
-                    "(первый запуск может качать модель; для скорости beam_size=1)",
-                    reply_markup=markup,
-                )
+                if normalize_audio:
+                    await _safe_edit_message(
+                        progress,
+                        "✅ WAV готов\n"
+                        "🎧 Отправляю обработанное аудио (нормализация + чистка щелчков)…",
+                        reply_markup=markup,
+                    )
+                    _check_cancel()
+                    try:
+                        processed_path = await loop.run_in_executor(
+                            None,
+                            lambda: _encode_audio_preview_ffmpeg(
+                                ffmpeg_bin=getattr(ap, "ffmpeg_bin", "ffmpeg"),
+                                src_wav=wav_path,
+                                out_dir=wav_dir,
+                                base_name=f"processed_{session_id[:8]}",
+                            ),
+                        )
+                        session["audio"]["processed_audio_path"] = os.path.basename(processed_path)
+                        session["audio"]["processed_audio_bytes"] = int(os.path.getsize(processed_path))
+                        try:
+                            logging.getLogger("local_telegram_bot").info(
+                                "Sending processed audio: %s (%d bytes)", processed_path, session["audio"]["processed_audio_bytes"]
+                            )
+                        except Exception:
+                            pass
+                        with open(processed_path, "rb") as f:
+                            try:
+                                await reply_target.reply_audio(
+                                    audio=f,
+                                    filename=os.path.basename(processed_path),
+                                    caption="🎧 Обработанное аудио (нормализация + чистка щелчков)",
+                                )
+                            except Exception:
+                                await reply_target.reply_document(
+                                    document=f,
+                                    filename=os.path.basename(processed_path),
+                                    caption="🎧 Обработанное аудио (нормализация + чистка щелчков)",
+                                )
+                    except Exception as exc:
+                        logging.getLogger("local_telegram_bot").exception("Failed to send processed audio")
+                        await reply_target.reply_text(f"⚠️ Не смог отправить обработанное аудио: {str(exc).strip()}")
+
+                    # Recreate progress message so it stays below the sent audio.
+                    await _safe_delete(progress)
+                    progress = await reply_target.reply_text(
+                        f"🧠 Whisper ({whisper_model}) — распознаю…\n"
+                        "(первый запуск может качать модель; для скорости beam_size=1)",
+                        reply_markup=markup,
+                    )
+                else:
+                    await _safe_edit_message(
+                        progress,
+                        "✅ WAV готов\n"
+                        f"🧠 Whisper ({whisper_model}) — распознаю…\n"
+                        "(первый запуск может качать модель; для скорости beam_size=1)",
+                        reply_markup=markup,
+                    )
                 cpu_threads = int((os.environ.get("WHISPER_CPU_THREADS") or "").strip() or "0")
                 whisper = TranscriptionService(
                     model_size=whisper_model,

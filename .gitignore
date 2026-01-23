@@ -33,6 +33,7 @@ bot.pid
 asr_stats.json
 usage_sessions.jsonl
 auth_state.json
+active_sessions.json
 .bot.lock
 
 # Model caches / large downloads

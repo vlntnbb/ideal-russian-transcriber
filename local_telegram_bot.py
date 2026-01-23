@@ -60,6 +60,7 @@ TELEGRAM_TEXT_LIMIT = 4096
 STATS_PATH = os.path.join(os.path.dirname(__file__), "asr_stats.json")
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_USAGE_LOG_PATH = os.path.join(os.path.dirname(__file__), "usage_sessions.jsonl")
+DEFAULT_ACTIVE_SESSIONS_PATH = os.path.join(os.path.dirname(__file__), "active_sessions.json")
 AUTH_STATE_PATH = os.path.join(os.path.dirname(__file__), "auth_state.json")
 DEFAULT_GEMINI_SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "gemini_system_prompt.md")
 
@@ -682,6 +683,43 @@ class _UserCancelled(Exception):
 
 def _active_sessions(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.application.bot_data.setdefault("active_sessions", {})
+
+
+def _write_active_sessions_snapshot(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Best-effort, local-only snapshot of currently running sessions.
+    Used by the dashboard to show live concurrency.
+    """
+    if not _truthy_env("ACTIVE_SESSIONS_ENABLED", True):
+        return
+    path = (os.environ.get("ACTIVE_SESSIONS_PATH") or "").strip() or DEFAULT_ACTIVE_SESSIONS_PATH
+    try:
+        sessions = _active_sessions(context) or {}
+        items = []
+        for sid, sess in sessions.items():
+            if not isinstance(sess, dict):
+                items.append({"session_id": sid})
+                continue
+            items.append(
+                {
+                    "session_id": sid,
+                    "started_at": sess.get("started_at"),
+                    "user_id": sess.get("user_id"),
+                    "chat_id": sess.get("chat_id"),
+                }
+            )
+        payload = {
+            "updated_at": datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat(),
+            "active_sessions": items,
+            "count": len(items),
+        }
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        # Must never affect bot flow.
+        pass
 
 
 def _ru_plural(n: int, one: str, few: str, many: str) -> str:
@@ -2014,12 +2052,14 @@ async def _process_audio(
     async with sem:
         session_id = uuid.uuid4().hex
         cancel_event = asyncio.Event()
+        started_at = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
         _active_sessions(context)[session_id] = {
             "cancel_event": cancel_event,
             "user_id": int(getattr(getattr(update, "effective_user", None), "id", 0) or 0),
             "chat_id": int(getattr(getattr(update, "effective_chat", None), "id", 0) or 0),
+            "started_at": started_at,
         }
-        started_at = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+        _write_active_sessions_snapshot(context)
         t0 = time.monotonic()
         user = update.effective_user
         chat = update.effective_chat
@@ -2588,6 +2628,7 @@ async def _process_audio(
                 _active_sessions(context).pop(session_id, None)
             except Exception:
                 pass
+            _write_active_sessions_snapshot(context)
             session["ended_at"] = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
             session["timings"] = session.get("timings") or {}
             session["timings"]["total_sec"] = round(time.monotonic() - t0, 3)

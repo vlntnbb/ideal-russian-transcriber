@@ -152,6 +152,8 @@ python3 -m dashboard.server
 - другой путь к логу: `python3 -m dashboard.server --usage-log /path/to/usage_sessions.jsonl`
 - другой порт: `python3 -m dashboard.server --port 9000`
 
+Для live‑индикатора “Сейчас в работе” бот пишет файл `active_sessions.json` рядом с проектом (по умолчанию). Его можно отключить: `ACTIVE_SESSIONS_ENABLED=0`.
+
 ## Авторизация Gemini и белый список чатов
 
 Авторизация включается параметром `AUTH_ENABLED=1`.

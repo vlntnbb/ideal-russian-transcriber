@@ -275,6 +275,22 @@ function renderTable(nodeId, rows, kind) {
   root.appendChild(table);
 }
 
+async function loadLive() {
+  const res = await fetch("/api/live", { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const live = await res.json();
+
+  const count = Number(live.count || 0);
+  const countEl = document.getElementById("liveCount");
+  const metaEl = document.getElementById("liveMeta");
+  const dotEl = document.getElementById("liveDot");
+
+  countEl.textContent = fmtInt(count);
+  metaEl.textContent = `upd: ${fmtIso(live.updated_at)}`;
+  if (count > 0) dotEl.classList.add("on");
+  else dotEl.classList.remove("on");
+}
+
 async function load() {
   const daysEl = document.getElementById("days");
   const days = daysEl.value;
@@ -333,3 +349,5 @@ function showError(err) {
 
 wire();
 load().catch(showError);
+loadLive().catch(() => {});
+setInterval(() => loadLive().catch(() => {}), 2000);

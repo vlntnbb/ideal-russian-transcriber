@@ -417,11 +417,18 @@ class _Cache:
     mtime_ns: int
     sessions: list[dict[str, Any]]
 
+@dataclass
+class _LiveCache:
+    mtime_ns: int
+    payload: dict[str, Any]
+
 
 class DashboardServer:
-    def __init__(self, *, usage_log_path: Path) -> None:
+    def __init__(self, *, usage_log_path: Path, active_sessions_path: Path) -> None:
         self.usage_log_path = usage_log_path
+        self.active_sessions_path = active_sessions_path
         self._cache: Optional[_Cache] = None
+        self._live_cache: Optional[_LiveCache] = None
 
     def load_sessions(self) -> list[dict[str, Any]]:
         try:
@@ -434,6 +441,34 @@ class DashboardServer:
         sessions = _read_jsonl(self.usage_log_path)
         self._cache = _Cache(mtime_ns=st.st_mtime_ns, sessions=sessions)
         return sessions
+
+    def load_live(self) -> dict[str, Any]:
+        """
+        Loads bot-written snapshot (active_sessions.json). Returns:
+          {count:int, updated_at:str|None, active_sessions:[...]}
+        """
+        try:
+            st = self.active_sessions_path.stat()
+        except FileNotFoundError:
+            self._live_cache = _LiveCache(mtime_ns=0, payload={"count": 0, "updated_at": None, "active_sessions": []})
+            return self._live_cache.payload
+
+        if self._live_cache and self._live_cache.mtime_ns == st.st_mtime_ns:
+            return self._live_cache.payload
+
+        payload: dict[str, Any] = {"count": 0, "updated_at": None, "active_sessions": []}
+        try:
+            data = json.loads(self.active_sessions_path.read_text(encoding="utf-8") or "{}")
+            if isinstance(data, dict):
+                payload["count"] = int(data.get("count") or 0)
+                payload["updated_at"] = data.get("updated_at")
+                items = data.get("active_sessions")
+                payload["active_sessions"] = items if isinstance(items, list) else []
+        except Exception:
+            pass
+
+        self._live_cache = _LiveCache(mtime_ns=st.st_mtime_ns, payload=payload)
+        return payload
 
 
 def _guess_content_type(path: Path) -> str:
@@ -486,6 +521,10 @@ def make_handler(server: DashboardServer):
                 self._send_json({"ok": True})
                 return
 
+            if path == "/api/live":
+                self._send_json(server.load_live())
+                return
+
             # Static routing
             if path == "/":
                 path = "/index.html"
@@ -513,14 +552,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=(os.environ.get("USAGE_LOG_PATH") or "").strip() or str(ROOT_DIR / "usage_sessions.jsonl"),
         help="Path to usage_sessions.jsonl (defaults to USAGE_LOG_PATH or ./usage_sessions.jsonl)",
     )
+    parser.add_argument(
+        "--active-sessions",
+        default=(os.environ.get("ACTIVE_SESSIONS_PATH") or "").strip() or str(ROOT_DIR / "active_sessions.json"),
+        help="Path to active_sessions.json (defaults to ACTIVE_SESSIONS_PATH or ./active_sessions.json)",
+    )
     args = parser.parse_args(argv)
 
     usage_log_path = Path(args.usage_log).expanduser()
-    srv = DashboardServer(usage_log_path=usage_log_path)
+    active_sessions_path = Path(args.active_sessions).expanduser()
+    srv = DashboardServer(usage_log_path=usage_log_path, active_sessions_path=active_sessions_path)
 
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(srv))
     print(f"Dashboard: http://{args.host}:{args.port}")
     print(f"Usage log: {usage_log_path}")
+    print(f"Live snapshot: {active_sessions_path}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

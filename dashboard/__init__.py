@@ -1,0 +1,2 @@
+"""Local analytics dashboard package."""
+

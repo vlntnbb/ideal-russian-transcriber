@@ -1011,9 +1011,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     domain = _auth_domain()
     intro = (
         "Добро пожаловать в идеальный (ну почти :)) транскрибатор русских аудио сообщений. "
-        "Я использую для транскрибации две модели: Whisper и GigaAM, "
-        "а затем с помощью LLM делаю их сравнительный анализ и итоговый вариант транскрибации.\n\n"
-        "Бот хорошо подходит для задач, когда важна точность транскрибации, а не скорость: "
+        "Я использую для транскрибации две SOTA модели: Whisper (medium) и GigaAM, "
+        "Whisper - хорошо распознает смешанный ru/en текст, а GigaAM - лучше русский. "
+        "Затем с помощью LLM делаю их сравнительный анализ и итоговый вариант транскрибации."
+        "LLM правит смысловые ошибки, пунктуацию, делает разбивку на абзацы и предложения.\n\n"
+        "Бот хорошо подходит для задач, когда важна точность транскрибации, а не скорость: "        
         "подготовка постов для social media, должностных инструкций и т.п.\n\n"
     )
 
@@ -1160,8 +1162,28 @@ def _pick_telegram_file_from_message(msg):
     if msg.audio:
         name = msg.audio.file_name or "audio"
         return msg.audio.file_id, name, msg.audio.file_size
+    if msg.video:
+        # Telegram Video doesn't always carry file_name.
+        ext = "mp4"
+        try:
+            mt = (msg.video.mime_type or "").lower()
+            if "webm" in mt:
+                ext = "webm"
+            elif "quicktime" in mt:
+                ext = "mov"
+            elif "mp4" in mt:
+                ext = "mp4"
+        except Exception:
+            pass
+        return msg.video.file_id, f"video.{ext}", msg.video.file_size
+    if getattr(msg, "video_note", None):
+        # video_note is typically an mp4 without filename.
+        return msg.video_note.file_id, "video_note.mp4", msg.video_note.file_size
     if msg.document and (msg.document.mime_type or "").startswith("audio/"):
         name = msg.document.file_name or "audio.bin"
+        return msg.document.file_id, name, msg.document.file_size
+    if msg.document and (msg.document.mime_type or "").startswith("video/"):
+        name = msg.document.file_name or "video.bin"
         return msg.document.file_id, name, msg.document.file_size
 
     return None, None, None
@@ -1915,7 +1937,7 @@ def _text_mentions_bot(text: str, *, bot_username: Optional[str]) -> bool:
 
 async def handle_group_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Group flow: reply to a voice/audio message and mention the bot (e.g. "@botname").
+    Group flow: reply to a voice/audio/video message and mention the bot (e.g. "@botname").
     """
     msg = update.effective_message
     if msg is None or not msg.text:
@@ -1956,7 +1978,7 @@ async def handle_group_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     file_id, filename, file_size = _pick_telegram_file_from_message(replied)
     if not file_id:
-        await msg.reply_text("Ответьте на voice/audio сообщение и упомяните меня (@...).")
+        await msg.reply_text("Ответьте на voice/audio/video сообщение и упомяните меня (@...).")
         return
 
     await _process_audio(
@@ -1983,7 +2005,7 @@ async def _process_audio(
     normalize_audio: bool = False,
 ) -> None:
     """
-    Core pipeline used by both private chats (direct voice/audio)
+    Core pipeline used by both private chats (direct voice/audio/video)
     and group chats (reply+mention).
     """
     sem: asyncio.Semaphore = context.application.bot_data.setdefault(
@@ -2578,7 +2600,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     file_id, filename, file_size = _pick_telegram_file(update)
     if not file_id:
-        await update.effective_message.reply_text("Пришлите voice/audio файл.")
+        await update.effective_message.reply_text("Пришлите voice/audio/video файл.")
         return
 
     # Use the shared pipeline (also used by reply+mention in group chats).
@@ -2860,7 +2882,17 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_cancel, pattern=r"^cancel:"))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & filters.REPLY, handle_group_tag))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_process_text))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, handle_audio))
+    app.add_handler(
+        MessageHandler(
+            filters.VOICE
+            | filters.AUDIO
+            | filters.VIDEO
+            | filters.VIDEO_NOTE
+            | filters.Document.AUDIO
+            | filters.Document.VIDEO,
+            handle_audio,
+        )
+    )
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

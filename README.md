@@ -1,7 +1,7 @@
 # Ideal Russian Transcriber — локальный Telegram ASR бот
 
 В этом репозитории есть:
-- `local_telegram_bot.py` — локальный Telegram-бот: принимает voice/audio, делает 2 транскрипции (Whisper + GigaAM) и формирует итог по шаблону через LLM
+- `local_telegram_bot.py` — локальный Telegram-бот: принимает voice/audio/video, делает 2 транскрипции (Whisper + GigaAM) и формирует итог по шаблону через LLM
 - `snapscript/` — обёртки для подготовки аудио и ASR
 
 ## Требования
@@ -110,7 +110,7 @@ source .venv/bin/activate
 python3 local_telegram_bot.py
 ```
 
-Отправьте боту voice/audio — он вернёт:
+Отправьте боту voice/audio/video — он вернёт:
 1) `Whisper: ...`
 2) `GigaAM: ...`
 3) Итоговый вариант (только секция `### Итоговый текст:`; если тексты не слишком длинные)
@@ -123,7 +123,7 @@ python3 local_telegram_bot.py
 
 Как пользоваться в группе:
 
-Ответьте на voice/audio сообщением и напишите текстом `@IdealRussianTranscribe_bot` — бот обработает именно то аудио, на которое вы ответили.
+Ответьте на voice/audio/video сообщением и напишите текстом `@IdealRussianTranscribe_bot` — бот обработает именно то сообщение, на которое вы ответили.
 
 Доп. режим (нормализация громкости + чистка щелчков): укажите ключ после упоминания бота, например `@IdealRussianTranscribe_bot norm` или `@IdealRussianTranscribe_bot норм`.
 
@@ -134,6 +134,23 @@ python3 local_telegram_bot.py
 Бот пишет отдельный usage-лог (JSONL) по каждой сессии распознавания: кто запросил, в каком чате, какие модели, длительность этапов и т.п.
 По умолчанию файл: `usage_sessions.jsonl` (настраивается через `USAGE_LOG_PATH`, выключается через `USAGE_LOG_ENABLED=0`).
 В лог не пишутся транскрипции/промпты — только метаданные и тайминги.
+
+### Локальный дашборд (аналитика)
+
+Есть простая локальная веб‑страница с аналитикой по `usage_sessions.jsonl` (кол-во запусков, пользователи/чаты, пики нагрузки, тайминги и т.п.).
+
+Запуск:
+
+```bash
+source .venv/bin/activate
+python3 -m dashboard.server
+```
+
+Откройте в браузере `http://127.0.0.1:8765`.
+
+Опции:
+- другой путь к логу: `python3 -m dashboard.server --usage-log /path/to/usage_sessions.jsonl`
+- другой порт: `python3 -m dashboard.server --port 9000`
 
 ## Авторизация Gemini и белый список чатов
 

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ideal Russian Transcriber — Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="container header">
+      <div>
+        <div class="title">Ideal Russian Transcriber</div>
+        <div class="subtitle">Локальная аналитика usage_sessions.jsonl</div>
+      </div>
+      <div class="controls">
+        <label class="select">
+          <span>Период</span>
+          <select id="days">
+            <option value="">Все</option>
+            <option value="1">24 часа</option>
+            <option value="7">7 дней</option>
+            <option value="30" selected>30 дней</option>
+            <option value="90">90 дней</option>
+          </select>
+        </label>
+        <button id="refresh" class="button">Обновить</button>
+      </div>
+    </header>
+
+    <main class="container">
+      <section class="grid cards" id="cards"></section>
+
+      <section class="grid two">
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title">Сессии по дням</div>
+            <div class="panel-meta" id="metaGenerated"></div>
+          </div>
+          <canvas id="chartDaily" height="160"></canvas>
+          <div class="legend" id="legendDaily"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title">Нагрузка</div>
+            <div class="panel-meta" id="metaLoad"></div>
+          </div>
+          <canvas id="chartHourly" height="160"></canvas>
+          <div class="hint">Показано: количество запусков по часу (UTC).</div>
+        </div>
+      </section>
+
+      <section class="grid two">
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title">Тайминги (OK)</div>
+            <div class="panel-meta">avg / p50 / p95</div>
+          </div>
+          <div id="timings" class="timings"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title">Модели</div>
+            <div class="panel-meta">топ по использованиям</div>
+          </div>
+          <div id="models" class="models"></div>
+        </div>
+      </section>
+
+      <section class="grid two">
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title">Топ пользователей</div>
+            <div class="panel-meta">по количеству сессий</div>
+          </div>
+          <div id="topUsers"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title">Топ чатов</div>
+            <div class="panel-meta">по количеству сессий</div>
+          </div>
+          <div id="topChats"></div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="container footer">
+      <div class="muted">
+        Данные берутся локально из usage_sessions.jsonl. Страница не отправляет ничего в сеть.
+      </div>
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
+

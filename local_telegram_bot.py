@@ -1057,6 +1057,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "подготовка постов для social media, должностных инструкций и т.п.\n\n"
     )
 
+    privacy_block = (
+        "Политика конфиденциальности:\n"
+        "- Бот не сохраняет текст транскрибации и LLM-промпты; в usage-лог попадают только метаданные (например, username/ID пользователя и ID чата).\n"
+        "- Для внешних пользователей используется локальная LLM на моем компьютере и ваши аудио и тексты нигде не сохраняются.\n"
+        "- Запросы сотрудников Business Booster обрабатывает Gemini 3 Pro в нашем корпоративном аккаунте.\n\n"
+    )
+
+    source_block = (
+        "Исходный код:\n"
+        "https://github.com/vlntnbb/ideal-russian-transcriber\n"
+        "Каждый может поднять такого бота у себя и доработать как нужно.\n"
+    )
+
     if _auth_enabled():
         auth_block = (
             "Если вы сотрудник Business Booster, авторизуйтесь по корпоративной почте, "
@@ -1071,7 +1084,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Бот будет работать с доступной LLM без проверки домена."
         )
 
-    await update.effective_message.reply_text(intro + auth_block)
+    await update.effective_message.reply_text(intro + privacy_block + auth_block + "\n\n" + source_block)
 
 
 async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

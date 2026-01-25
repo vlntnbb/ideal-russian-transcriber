@@ -194,7 +194,7 @@ def _bot_concurrent_updates() -> int:
 
 
 def _asr_concurrency() -> int:
-    return max(1, _int_env("ASR_CONCURRENCY", 2))
+    return max(1, _int_env("ASR_CONCURRENCY", 3))
 
 
 def _llm_concurrency() -> int:
@@ -685,6 +685,91 @@ def _active_sessions(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.application.bot_data.setdefault("active_sessions", {})
 
 
+def _asr_queue(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    return context.application.bot_data.setdefault("asr_queue", [])
+
+
+def _asr_state_lock(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Lock:
+    return context.application.bot_data.setdefault("asr_state_lock", asyncio.Lock())
+
+
+async def _asr_get_state(context: ContextTypes.DEFAULT_TYPE, *, session_id: str) -> tuple[int, int, int]:
+    """
+    Returns (active, position, limit). Position is 1-based, 0 if not in queue.
+    """
+    lock = _asr_state_lock(context)
+    async with lock:
+        active = int(context.application.bot_data.get("asr_active", 0) or 0)
+        limit = int(context.application.bot_data.get("asr_semaphore_limit", _asr_concurrency()) or _asr_concurrency())
+        q = _asr_queue(context)
+        try:
+            pos = q.index(session_id) + 1
+        except ValueError:
+            pos = 0
+        return active, pos, limit
+
+
+async def _asr_enqueue(context: ContextTypes.DEFAULT_TYPE, *, session_id: str) -> tuple[int, int, int]:
+    """
+    Enqueue session_id. Returns (active, position, limit).
+    """
+    lock = _asr_state_lock(context)
+    async with lock:
+        q = _asr_queue(context)
+        if session_id not in q:
+            q.append(session_id)
+        active = int(context.application.bot_data.get("asr_active", 0) or 0)
+        limit = int(context.application.bot_data.get("asr_semaphore_limit", _asr_concurrency()) or _asr_concurrency())
+        return active, q.index(session_id) + 1, limit
+
+
+async def _asr_dequeue(context: ContextTypes.DEFAULT_TYPE, *, session_id: str) -> None:
+    lock = _asr_state_lock(context)
+    async with lock:
+        q = _asr_queue(context)
+        try:
+            q.remove(session_id)
+        except ValueError:
+            pass
+
+
+async def _asr_active_inc(context: ContextTypes.DEFAULT_TYPE) -> None:
+    lock = _asr_state_lock(context)
+    async with lock:
+        cur = int(context.application.bot_data.get("asr_active", 0) or 0)
+        context.application.bot_data["asr_active"] = cur + 1
+
+
+async def _asr_active_dec(context: ContextTypes.DEFAULT_TYPE) -> None:
+    lock = _asr_state_lock(context)
+    async with lock:
+        cur = int(context.application.bot_data.get("asr_active", 0) or 0)
+        context.application.bot_data["asr_active"] = max(0, cur - 1)
+
+
+async def _queue_wait_updater(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    message,
+    session_id: str,
+    stop_event: asyncio.Event,
+) -> None:
+    try:
+        while not stop_event.is_set():
+            active, pos, limit = await _asr_get_state(context, session_id=session_id)
+            if pos <= 0:
+                return
+            word = _ru_plural(active, "транскрибация", "транскрибации", "транскрибаций")
+            text = f"⏳ Сейчас обрабатывается {active} {word}.\nВаш файл в очереди под номером {pos}."
+            try:
+                await _safe_edit_message(message, text, reply_markup=None)
+            except Exception:
+                return
+            await asyncio.sleep(2.0)
+    except asyncio.CancelledError:
+        return
+
+
 def _write_active_sessions_snapshot(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Best-effort, local-only snapshot of currently running sessions.
@@ -1051,7 +1136,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Добро пожаловать в идеальный (ну почти :)) транскрибатор русских аудио сообщений. "
         "Я использую для транскрибации две SOTA модели: Whisper (medium) и GigaAM, "
         "Whisper - хорошо распознает смешанный ru/en текст, а GigaAM - лучше русский. "
-        "Затем с помощью LLM делаю их сравнительный анализ и итоговый вариант транскрибации."
+        "Затем с помощью LLM делаю их сравнительный анализ и итоговый вариант транскрибации. "
         "LLM правит смысловые ошибки, пунктуацию, делает разбивку на абзацы и предложения.\n\n"
         "Бот хорошо подходит для задач, когда важна точность транскрибации, а не скорость: "        
         "подготовка постов для social media, должностных инструкций и т.п.\n\n"
@@ -2059,11 +2144,50 @@ async def _process_audio(
     Core pipeline used by both private chats (direct voice/audio/video)
     and group chats (reply+mention).
     """
-    sem: asyncio.Semaphore = context.application.bot_data.setdefault(
-        "asr_semaphore", asyncio.Semaphore(_asr_concurrency())
-    )
-    async with sem:
-        session_id = uuid.uuid4().hex
+    limit = _asr_concurrency()
+    sem: asyncio.Semaphore = context.application.bot_data.setdefault("asr_semaphore", asyncio.Semaphore(limit))
+    context.application.bot_data.setdefault("asr_semaphore_limit", limit)
+
+    session_id = uuid.uuid4().hex
+    wait_message = None
+    wait_stop = asyncio.Event()
+    wait_task: Optional[asyncio.Task] = None
+
+    active, pos, sem_limit = await _asr_enqueue(context, session_id=session_id)
+    should_show_wait = active >= sem_limit or pos > 1
+    if should_show_wait:
+        try:
+            word = _ru_plural(active, "транскрибация", "транскрибации", "транскрибаций")
+            wait_message = await reply_target.reply_text(
+                f"⏳ Сейчас обрабатывается {active} {word}.\n"
+                f"Ваш файл в очереди под номером {pos}."
+            )
+            wait_task = asyncio.create_task(
+                _queue_wait_updater(context, message=wait_message, session_id=session_id, stop_event=wait_stop)
+            )
+        except Exception:
+            wait_message = None
+
+    try:
+        await sem.acquire()
+    except asyncio.CancelledError:
+        await _asr_dequeue(context, session_id=session_id)
+        wait_stop.set()
+        if wait_task is not None:
+            wait_task.cancel()
+        if wait_message is not None:
+            await _safe_delete(wait_message)
+        raise
+
+    await _asr_dequeue(context, session_id=session_id)
+    await _asr_active_inc(context)
+    try:
+        wait_stop.set()
+        if wait_task is not None:
+            wait_task.cancel()
+        if wait_message is not None:
+            await _safe_delete(wait_message)
+
         cancel_event = asyncio.Event()
         started_at = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
         _active_sessions(context)[session_id] = {
@@ -2646,6 +2770,12 @@ async def _process_audio(
             session["timings"] = session.get("timings") or {}
             session["timings"]["total_sec"] = round(time.monotonic() - t0, 3)
             _log_usage_session(session)
+    finally:
+        try:
+            sem.release()
+        except Exception:
+            pass
+        await _asr_active_dec(context)
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # In groups, process only via reply+mention flow to avoid accidental triggers/spam.

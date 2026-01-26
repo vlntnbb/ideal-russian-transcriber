@@ -244,6 +244,10 @@ def _compute_analytics(
                     "sessions_ok": 0,
                     "sessions_canceled": 0,
                     "sessions_error": 0,
+                    "sessions_internal": 0,
+                    "sessions_external": 0,
+                    "sessions_unknown": 0,
+                    "kind": "unknown",  # internal|external|unknown
                     "first_seen_at": started_at,
                     "last_seen_at": started_at,
                 },
@@ -289,12 +293,18 @@ def _compute_analytics(
                 if bool((auth or {}).get("user_authorized")):
                     internal_users.add(uid)
                     internal_sessions += 1
+                    users[uid]["sessions_internal"] += 1
+                    users[uid]["kind"] = "internal"
                 else:
                     external_users.add(uid)
                     external_sessions += 1
+                    users[uid]["sessions_external"] += 1
+                    if users[uid].get("kind") != "internal":
+                        users[uid]["kind"] = "external"
             else:
                 unknown_users.add(uid)
                 unknown_sessions += 1
+                users[uid]["sessions_unknown"] += 1
 
         audio = s.get("audio") if isinstance(s.get("audio"), dict) else {}
         wav_sec = _safe_float((audio or {}).get("wav_sec"))

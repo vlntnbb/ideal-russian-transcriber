@@ -47,17 +47,28 @@ function renderCards(data) {
 
   const items = [
     { k: "Сессий (всего)", v: fmtInt(s.sessions_total), s: `OK: ${fmtInt(s.sessions_ok)} · Cancel: ${fmtInt(s.sessions_canceled)} · Err: ${fmtInt(s.sessions_error)}` },
-    { k: "Пользователей", v: fmtInt(s.unique_users), s: `Внутр.: ${fmtInt(s.internal_users)} · Внешн.: ${fmtInt(s.external_users)} · ? ${fmtInt(s.unknown_users)}` },
+    {
+      k: "Пользователей",
+      v: fmtInt(s.unique_users),
+      sNode: el("div", {}, [
+        el("span", { class: "badge internal", text: `BB ${fmtInt(s.internal_users)}` }),
+        el("span", { class: "badge external", text: `EXT ${fmtInt(s.external_users)}` }),
+        el("span", { class: "badge unknown", text: `? ${fmtInt(s.unknown_users)}` }),
+      ]),
+    },
     { k: "Чатов", v: fmtInt(s.unique_chats), s: "private + group/supergroup" },
     { k: "Пик (в час)", v: fmtInt(s.peak_sessions_per_hour), s: fmtIso(s.peak_sessions_per_hour_at) },
     { k: "Пик (конкурентно)", v: fmtInt(s.peak_concurrency), s: fmtIso(s.peak_concurrency_at) },
   ];
 
   for (const it of items) {
+    const sEl = el("div", { class: "s" });
+    if (it.sNode) sEl.appendChild(it.sNode);
+    else sEl.textContent = it.s || "";
     const card = el("div", { class: "card wide" }, [
       el("div", { class: "k", text: it.k }),
       el("div", { class: "v", text: it.v }),
-      el("div", { class: "s", text: it.s }),
+      sEl,
     ]);
     cards.appendChild(card);
   }
@@ -250,14 +261,22 @@ function renderTable(nodeId, rows, kind) {
 
   if (kind === "users") {
     for (const r of rows) {
-      tbody.appendChild(el("tr", {}, [
-        el("td", { text: r.label || r.user_id }),
+      const k = (r.kind || "unknown").toLowerCase();
+      const badgeLabel = k === "internal" ? "BB" : (k === "external" ? "EXT" : "?");
+      const badge = el("span", { class: `badge ${k}`, text: badgeLabel });
+      const nameCell = el("td", {});
+      nameCell.appendChild(badge);
+      nameCell.appendChild(document.createTextNode(String(r.label || r.user_id)));
+
+      const tr = el("tr", { class: k }, [
+        nameCell,
         el("td", { class: "right", text: fmtInt(r.sessions_total) }),
         el("td", { class: "right", text: fmtInt(r.sessions_ok) }),
         el("td", { class: "right", text: fmtInt(r.sessions_canceled) }),
         el("td", { class: "right", text: fmtInt(r.sessions_error) }),
         el("td", { class: "right muted", text: fmtIso(r.last_seen_at) }),
-      ]));
+      ]);
+      tbody.appendChild(tr);
     }
   } else {
     for (const r of rows) {

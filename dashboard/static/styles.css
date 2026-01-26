@@ -134,6 +134,23 @@ select{
 .dot.bad{ background: var(--bad); }
 .dot.accent{ background: var(--accent); }
 
+.badge{
+  display:inline-flex;
+  align-items:center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,.14);
+  background: rgba(255,255,255,.06);
+  font-size: 12px;
+  color: var(--muted);
+  margin-right: 8px;
+  vertical-align: middle;
+}
+.badge.internal{ background: rgba(61,220,151,.14); border-color: rgba(61,220,151,.22); color: rgba(255,255,255,.88); }
+.badge.external{ background: rgba(122,162,255,.14); border-color: rgba(122,162,255,.22); color: rgba(255,255,255,.88); }
+.badge.unknown{ background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.12); }
+
 .panel{
   padding: 14px 14px;
   border: 1px solid var(--border);
@@ -197,5 +214,9 @@ tr td{ border-bottom: 1px solid rgba(255,255,255,.08); }
 tr:last-child td{ border-bottom: none; }
 .right{ text-align:right; font-family: var(--mono); }
 .muted{ color: var(--muted); }
+
+tr.internal td{ background: rgba(61,220,151,.06); }
+tr.external td{ background: rgba(122,162,255,.06); }
+tr.unknown td{ background: transparent; }
 
 .footer{ padding-bottom: 28px; }

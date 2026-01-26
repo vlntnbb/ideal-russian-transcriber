@@ -35,6 +35,9 @@ usage_sessions.jsonl
 auth_state.json
 active_sessions.json
 .bot.lock
+*.m4a
+*.mp3
+*.ogg
 
 # Model caches / large downloads
 *.ckpt

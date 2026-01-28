@@ -39,6 +39,7 @@ from snapscript.core.audio_processor import (
     gigaam_transcribe_worker,
 )
 from snapscript.utils.logging_utils import setup_logging
+from transcribe_core.markdown import render_markdown
 
 # Prevent multiple polling instances in the same repo (avoids Telegram getUpdates Conflict).
 def _acquire_bot_lock(lock_path: str) -> None:
@@ -1404,27 +1405,12 @@ async def _send_markdown_file(
     chat_id = update.effective_chat.id if update.effective_chat else "chat"
     filename = f"transcript_{chat_id}_{now}.md"
 
-    if final_error and not final_text:
-        final_block = (
-            "### Итоговый текст:\n\n"
-            f"_({final_label} не смог сформировать итог)_\n\n"
-            "### Примечания для контент-менеджера:\n\n"
-            "_(нет)_\n\n"
-            "### Отчет о проделанных действиях:\n\n"
-            f"- Ошибка: `{final_error.strip()}`\n"
-        )
-    else:
-        final_block = (final_text or "").strip()
-
-    content = (
-        f"## 1) Итоговый вариант по шаблону ({final_label})\n\n"
-        f"{final_block}\n\n"
-        "---\n\n"
-        "## 2) Вариант Whisper\n\n"
-        f"{(whisper_text or '').strip()}\n\n"
-        "---\n\n"
-        "## 3) Вариант GigaAM\n\n"
-        f"{(gigaam_text or '').strip()}\n"
+    content = render_markdown(
+        final_text=final_text,
+        final_error=final_error,
+        final_label=final_label,
+        whisper_text=whisper_text,
+        gigaam_text=gigaam_text,
     )
     bio = io.BytesIO(content.encode("utf-8"))
     bio.name = filename

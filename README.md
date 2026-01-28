@@ -119,6 +119,25 @@ python3 local_telegram_bot.py
    - Вариант Whisper
    - Вариант GigaAM
 
+## CLI транскрибации (как внешний скрипт)
+
+Для интеграций (например, другого бота) есть простой CLI, который принимает локальный файл и пишет артефакты в папку.
+
+Пример:
+
+```bash
+source .venv/bin/activate
+python3 transcribe_cli.py --in ./Recording14.m4a --out ./out --norm
+```
+
+CLI создаёт в `--out`:
+- `original.*` — копия исходного файла
+- `asr_*.wav` — WAV (16kHz mono) и (если `--norm`) нормализованный вариант
+- `whisper.txt` / `whisper.json`
+- `gigaam.txt` / `gigaam.json`
+- `transcript.md` — итог + обе транскрибации
+- `result.json` — метаданные (тайминги, модели, пути)
+
 ### Работа в групповом чате
 
 Как пользоваться в группе:

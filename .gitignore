@@ -35,6 +35,9 @@ usage_sessions.jsonl
 auth_state.json
 active_sessions.json
 .bot.lock
+
+# Local-only nested project (not committed)
+Content Agent/
 *.m4a
 *.mp3
 *.ogg

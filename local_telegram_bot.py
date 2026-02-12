@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
@@ -20,6 +21,7 @@ import ssl
 import subprocess
 import threading
 import multiprocessing
+import wave
 from email.message import EmailMessage
 from typing import Optional
 
@@ -80,6 +82,8 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "deepseek-r1:8b"
 DEFAULT_AUDIO_NORMALIZE_KEY = "norm,норм"
 DEFAULT_AUDIO_NORMALIZE_FILTER = "adeclick,dynaudnorm=f=500:g=11:p=0.95:m=20"
+TWO_FILE_MEDIA_GROUP_WAIT_SEC = 1.2
+TWO_FILE_CHOICE_TTL_SEC = 5 * 60
 
 _USAGE_LOGGER: Optional[logging.Logger] = None
 
@@ -720,6 +724,15 @@ def _cancel_markup(session_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def _two_file_choice_markup(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("По-отдельности", callback_data=f"twofiles:sep:{token}")],
+            [InlineKeyboardButton("Склеить в один", callback_data=f"twofiles:merge:{token}")],
+        ]
+    )
+
+
 class _UserCancelled(Exception):
     pass
 
@@ -734,6 +747,26 @@ def _asr_queue(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
 
 def _asr_state_lock(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Lock:
     return context.application.bot_data.setdefault("asr_state_lock", asyncio.Lock())
+
+
+def _two_file_state_lock(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Lock:
+    return context.application.bot_data.setdefault("two_file_state_lock", asyncio.Lock())
+
+
+def _pending_media_groups(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.application.bot_data.setdefault("pending_media_groups", {})
+
+
+def _pending_two_file_choices(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.application.bot_data.setdefault("pending_two_file_choices", {})
+
+
+def _cleanup_two_file_choices(choices: dict) -> None:
+    now = time.monotonic()
+    for token, payload in list(choices.items()):
+        created = float((payload or {}).get("created_monotonic") or 0.0)
+        if created <= 0 or (now - created) > TWO_FILE_CHOICE_TTL_SEC:
+            choices.pop(token, None)
 
 
 async def _asr_get_state(context: ContextTypes.DEFAULT_TYPE, *, session_id: str) -> tuple[int, int, int]:
@@ -1055,6 +1088,322 @@ async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await q.message.edit_text("⛔️ Отмена запрошена — завершаю текущий шаг…", reply_markup=None)
     except Exception:
         pass
+
+
+def _sanitize_filename(name: Optional[str], *, fallback: str) -> str:
+    raw = os.path.basename((name or "").strip())
+    if not raw:
+        raw = fallback
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+    return safe or fallback
+
+
+def _concat_wav_files(wav_paths: list[str], out_path: str) -> None:
+    if len(wav_paths) < 2:
+        raise ValueError("Need at least two WAV files to concatenate.")
+
+    first_format = None
+    with wave.open(out_path, "wb") as w_out:
+        for p in wav_paths:
+            with wave.open(p, "rb") as w_in:
+                fmt = (
+                    int(w_in.getnchannels()),
+                    int(w_in.getsampwidth()),
+                    int(w_in.getframerate()),
+                    str(w_in.getcomptype()),
+                    str(w_in.getcompname()),
+                )
+                if first_format is None:
+                    first_format = fmt
+                    w_out.setnchannels(fmt[0])
+                    w_out.setsampwidth(fmt[1])
+                    w_out.setframerate(fmt[2])
+                elif fmt != first_format:
+                    raise RuntimeError("WAV formats mismatch; cannot concatenate.")
+                w_out.writeframes(w_in.readframes(w_in.getnframes()))
+
+
+async def _run_items_separately(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    items: list[dict],
+    announce_text: Optional[str] = None,
+) -> None:
+    if not items:
+        return
+    ordered = sorted(items, key=lambda x: int(x.get("source_message_id") or 0))
+    first_reply = ordered[0].get("reply_target")
+    if announce_text and first_reply is not None:
+        try:
+            await first_reply.reply_text(announce_text)
+        except Exception:
+            pass
+
+    total = len(ordered)
+    for idx, item in enumerate(ordered, start=1):
+        reply_target = item.get("reply_target") or getattr(item.get("update"), "effective_message", None)
+        if reply_target is None:
+            continue
+        if total > 1 and reply_target is not None:
+            try:
+                await reply_target.reply_text(f"▶️ Файл {idx}/{total}: запускаю обработку…")
+            except Exception:
+                pass
+        await _process_audio(
+            item["update"],
+            context,
+            file_id=str(item["file_id"]),
+            filename=str(item.get("filename") or "audio"),
+            reply_target=reply_target,
+            source_message_id=item.get("source_message_id"),
+            source_file_size=item.get("source_file_size"),
+            normalize_audio=bool(item.get("normalize_audio")),
+        )
+
+
+async def _run_two_items_merged(context: ContextTypes.DEFAULT_TYPE, *, items: list[dict]) -> None:
+    if len(items) != 2:
+        await _run_items_separately(context, items=items)
+        return
+
+    ordered = sorted(items, key=lambda x: int(x.get("source_message_id") or 0))
+    first = ordered[0]
+    reply_target = first.get("reply_target") or getattr(first.get("update"), "effective_message", None)
+    if reply_target is None:
+        await _run_items_separately(context, items=ordered)
+        return
+    status = None
+    try:
+        if reply_target is not None:
+            status = await reply_target.reply_text("📎 Склеиваю 2 файла в один…")
+
+        with tempfile.TemporaryDirectory(prefix="tg_asr_merge2_") as td:
+            ap = AudioProcessor()
+            loop = asyncio.get_running_loop()
+            wav_parts: list[str] = []
+            total_size = 0
+
+            for idx, item in enumerate(ordered, start=1):
+                if status is not None:
+                    await _safe_edit(status, f"📥 Скачиваю файл {idx}/2…")
+                tg_file = await context.bot.get_file(str(item["file_id"]))
+                safe_name = _sanitize_filename(item.get("filename"), fallback=f"part{idx}.bin")
+                src_path = os.path.join(td, f"{idx}_{safe_name}")
+                await tg_file.download_to_drive(custom_path=src_path)
+                total_size += int(item.get("source_file_size") or 0)
+                if status is not None:
+                    await _safe_edit(status, f"🎛 Готовлю WAV для файла {idx}/2…")
+                wav_path = await loop.run_in_executor(None, lambda p=src_path: ap.extract_audio(p, output_dir=td))
+                wav_parts.append(wav_path)
+
+            merged_input = os.path.join(td, "merged_input.wav")
+            if status is not None:
+                await _safe_edit(status, "📎 Склеиваю WAV…")
+            await loop.run_in_executor(None, lambda: _concat_wav_files(wav_parts, merged_input))
+            await _safe_delete(status)
+
+            await _process_audio(
+                first["update"],
+                context,
+                file_id=f"merged:{ordered[0]['file_id']}+{ordered[1]['file_id']}",
+                filename="merged_input.wav",
+                reply_target=reply_target,
+                source_message_id=first.get("source_message_id"),
+                source_file_size=(total_size or None),
+                normalize_audio=bool(first.get("normalize_audio")) or bool(ordered[1].get("normalize_audio")),
+                local_source_path=merged_input,
+                working_dir=td,
+            )
+    except Exception as exc:
+        await _safe_delete(status)
+        if reply_target is not None:
+            await reply_target.reply_text(f"Ошибка при склейке двух файлов: {str(exc).strip() or exc.__class__.__name__}")
+
+
+async def _offer_two_file_choice(context: ContextTypes.DEFAULT_TYPE, *, items: list[dict]) -> None:
+    if len(items) != 2:
+        await _run_items_separately(context, items=items)
+        return
+
+    ordered = sorted(items, key=lambda x: int(x.get("source_message_id") or 0))
+    first = ordered[0]
+    reply_target = first.get("reply_target") or getattr(first.get("update"), "effective_message", None)
+    if reply_target is None:
+        await _run_items_separately(context, items=ordered)
+        return
+
+    token = secrets.token_urlsafe(8)
+    try:
+        prompt = await reply_target.reply_text(
+            "Получил 2 файла одновременно.\nКак обработать?",
+            reply_markup=_two_file_choice_markup(token),
+        )
+    except Exception:
+        await _run_items_separately(context, items=ordered)
+        return
+
+    lock = _two_file_state_lock(context)
+    async with lock:
+        choices = _pending_two_file_choices(context)
+        _cleanup_two_file_choices(choices)
+        choices[token] = {
+            "items": ordered,
+            "chat_id": int(getattr(getattr(first.get("update"), "effective_chat", None), "id", 0) or 0),
+            "user_id": int(getattr(getattr(first.get("update"), "effective_user", None), "id", 0) or 0),
+            "prompt_message_id": int(getattr(prompt, "message_id", 0) or 0),
+            "created_monotonic": time.monotonic(),
+        }
+
+
+async def _finalize_media_group_pair(context: ContextTypes.DEFAULT_TYPE, *, key: str) -> None:
+    try:
+        await asyncio.sleep(TWO_FILE_MEDIA_GROUP_WAIT_SEC)
+        lock = _two_file_state_lock(context)
+        async with lock:
+            pending = _pending_media_groups(context)
+            group = pending.pop(key, None)
+        if not group:
+            return
+
+        items = list(group.get("items") or [])
+        if len(items) == 2:
+            await _offer_two_file_choice(context, items=items)
+            return
+
+        if len(items) >= 1:
+            await _run_items_separately(
+                context,
+                items=items,
+                announce_text=(
+                    f"Получил {len(items)} файла одновременно — обработаю их по-отдельности."
+                    if len(items) > 1
+                    else None
+                ),
+            )
+    except Exception:
+        logging.getLogger("local_telegram_bot").exception("Failed to finalize media-group files")
+
+
+async def _handle_media_group_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    file_id: str,
+    filename: str,
+    file_size: Optional[int],
+) -> bool:
+    msg = update.effective_message
+    if msg is None:
+        return False
+    media_group_id = getattr(msg, "media_group_id", None)
+    if not media_group_id:
+        return False
+    chat_id = int(getattr(getattr(update, "effective_chat", None), "id", 0) or 0)
+    if chat_id == 0:
+        return False
+
+    item = {
+        "update": update,
+        "file_id": file_id,
+        "filename": filename or "audio",
+        "source_file_size": file_size,
+        "source_message_id": int(getattr(msg, "message_id", 0) or 0) or None,
+        "reply_target": msg,
+        "normalize_audio": False,
+    }
+    key = f"{chat_id}:{media_group_id}"
+
+    should_start_task = False
+    lock = _two_file_state_lock(context)
+    async with lock:
+        pending = _pending_media_groups(context)
+        group = pending.get(key)
+        if group is None:
+            group = {
+                "chat_id": chat_id,
+                "media_group_id": str(media_group_id),
+                "items": [],
+                "created_monotonic": time.monotonic(),
+                "task": None,
+            }
+            pending[key] = group
+
+        msg_id = int(item.get("source_message_id") or 0)
+        exists = any(int((it or {}).get("source_message_id") or 0) == msg_id for it in (group.get("items") or []))
+        if not exists:
+            group["items"].append(item)
+        should_start_task = group.get("task") is None
+
+    if should_start_task:
+        t = asyncio.create_task(_finalize_media_group_pair(context, key=key))
+        lock = _two_file_state_lock(context)
+        async with lock:
+            group = _pending_media_groups(context).get(key)
+            if group is not None and group.get("task") is None:
+                group["task"] = t
+    return True
+
+
+async def cb_two_files_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = getattr(update, "callback_query", None)
+    if not q or not getattr(q, "data", None):
+        return
+    data = str(q.data)
+    if not data.startswith("twofiles:"):
+        return
+
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return
+    mode, token = parts[1].strip(), parts[2].strip()
+    if mode not in {"sep", "merge"} or not token:
+        return
+
+    current_user_id = int(getattr(getattr(update, "effective_user", None), "id", 0) or 0)
+    payload = None
+    lock = _two_file_state_lock(context)
+    async with lock:
+        choices = _pending_two_file_choices(context)
+        _cleanup_two_file_choices(choices)
+        candidate = choices.get(token)
+        expected_user_id = int((candidate or {}).get("user_id") or 0)
+        if not candidate:
+            payload = None
+        elif expected_user_id and current_user_id and expected_user_id != current_user_id:
+            payload = "__forbidden__"
+        else:
+            payload = choices.pop(token, None)
+
+    if payload is None:
+        try:
+            await q.answer("Выбор уже неактуален.", show_alert=False)
+        except Exception:
+            pass
+        return
+    if payload == "__forbidden__":
+        try:
+            await q.answer("Эта кнопка не для вас.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        await q.answer("Принято.", show_alert=False)
+    except Exception:
+        pass
+    try:
+        if mode == "merge":
+            await q.message.edit_text("Выбрано: склеить 2 файла и обработать как один.", reply_markup=None)
+        else:
+            await q.message.edit_text("Выбрано: обработать 2 файла по-отдельности.", reply_markup=None)
+    except Exception:
+        pass
+
+    items = list((payload or {}).get("items") or [])
+    if mode == "merge":
+        await _run_two_items_merged(context, items=items)
+    else:
+        await _run_items_separately(context, items=items)
 
 
 async def _reply_long(update: Update, text: str) -> None:
@@ -2218,6 +2567,8 @@ async def _process_audio(
     source_message_id: Optional[int] = None,
     source_file_size: Optional[int] = None,
     normalize_audio: bool = False,
+    local_source_path: Optional[str] = None,
+    working_dir: Optional[str] = None,
 ) -> None:
     """
     Core pipeline used by both private chats (direct voice/audio/video)
@@ -2376,40 +2727,55 @@ async def _process_audio(
             progress = await reply_target.reply_text("Старт…", reply_markup=markup)
             chat_id = int(update.effective_chat.id) if update.effective_chat else None
 
-            await _safe_edit_message(progress, "📥 Скачиваю аудио…", reply_markup=markup)
-            max_bytes = _telegram_max_get_file_bytes()
-            if max_bytes and source_file_size and source_file_size > max_bytes:
-                size_mb = source_file_size / (1024 * 1024)
-                limit_mb = max_bytes / (1024 * 1024)
-                session["status"] = "error"
-                session["error"] = f"incoming_file_too_big({size_mb:.1f}MB>{limit_mb:.0f}MB)"
-                await _safe_delete(progress)
-                await reply_target.reply_text(_file_too_big_message(size_mb=size_mb, limit_mb=limit_mb))
-                return
-
-            try:
-                tg_file = await context.bot.get_file(file_id)
-            except BadRequest as exc:
-                if "file is too big" in str(exc).lower():
-                    size_mb = (source_file_size or 0) / (1024 * 1024)
-                    max_bytes = _telegram_max_get_file_bytes()
-                    limit_mb = (max_bytes / (1024 * 1024)) if max_bytes else 20
+            tg_file = None
+            source_ready_label = "✅ Аудио подготовлено"
+            if local_source_path:
+                if not os.path.exists(local_source_path):
+                    raise FileNotFoundError(f"Local audio not found: {local_source_path}")
+                session["audio"]["local_source"] = os.path.basename(local_source_path)
+                session["audio"]["local_source_mode"] = "provided"
+            else:
+                source_ready_label = "✅ Аудио скачано"
+                await _safe_edit_message(progress, "📥 Скачиваю аудио…", reply_markup=markup)
+                max_bytes = _telegram_max_get_file_bytes()
+                if max_bytes and source_file_size and source_file_size > max_bytes:
+                    size_mb = source_file_size / (1024 * 1024)
+                    limit_mb = max_bytes / (1024 * 1024)
                     session["status"] = "error"
-                    session["error"] = "telegram_get_file_too_big"
+                    session["error"] = f"incoming_file_too_big({size_mb:.1f}MB>{limit_mb:.0f}MB)"
                     await _safe_delete(progress)
                     await reply_target.reply_text(_file_too_big_message(size_mb=size_mb, limit_mb=limit_mb))
                     return
-                raise
 
-            with tempfile.TemporaryDirectory(prefix="tg_asr_") as td:
+                try:
+                    tg_file = await context.bot.get_file(file_id)
+                except BadRequest as exc:
+                    if "file is too big" in str(exc).lower():
+                        size_mb = (source_file_size or 0) / (1024 * 1024)
+                        max_bytes = _telegram_max_get_file_bytes()
+                        limit_mb = (max_bytes / (1024 * 1024)) if max_bytes else 20
+                        session["status"] = "error"
+                        session["error"] = "telegram_get_file_too_big"
+                        await _safe_delete(progress)
+                        await reply_target.reply_text(_file_too_big_message(size_mb=size_mb, limit_mb=limit_mb))
+                        return
+                    raise
+
+            tmp_ctx = contextlib.nullcontext(working_dir) if working_dir else tempfile.TemporaryDirectory(prefix="tg_asr_")
+            with tmp_ctx as td:
                 _check_cancel()
-                src_path = os.path.join(td, filename)
+                if not td:
+                    raise RuntimeError("No working directory available for transcription.")
                 wav_dir = td
-
-                dl0 = time.monotonic()
-                await tg_file.download_to_drive(custom_path=src_path)
-                _check_cancel()
-                session["timings"] = {"download_sec": round(time.monotonic() - dl0, 3)}
+                src_path = local_source_path
+                if not local_source_path:
+                    src_path = os.path.join(td, filename)
+                    dl0 = time.monotonic()
+                    await tg_file.download_to_drive(custom_path=src_path)
+                    _check_cancel()
+                    session["timings"] = {"download_sec": round(time.monotonic() - dl0, 3)}
+                else:
+                    session["timings"] = {"download_sec": 0.0}
 
                 ap = AudioProcessor()
                 loop = asyncio.get_running_loop()
@@ -2417,11 +2783,11 @@ async def _process_audio(
                 if normalize_audio:
                     await _safe_edit_message(
                         progress,
-                        "✅ Аудио скачано\n🎚 Нормализую аудио и готовлю WAV (16kHz mono)…",
+                        f"{source_ready_label}\n🎚 Нормализую аудио и готовлю WAV (16kHz mono)…",
                         reply_markup=markup,
                     )
                 else:
-                    await _safe_edit_message(progress, "✅ Аудио скачано\n🎛 Готовлю WAV (16kHz mono)…", reply_markup=markup)
+                    await _safe_edit_message(progress, f"{source_ready_label}\n🎛 Готовлю WAV (16kHz mono)…", reply_markup=markup)
                 ex0 = time.monotonic()
                 audio_filter = _audio_normalize_filter() if normalize_audio else None
                 if normalize_audio:
@@ -2886,6 +3252,16 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text("Пришлите voice/audio/video файл.")
         return
 
+    # In private chats, collect media-group items and offer "separate vs merged" for 2 files.
+    if await _handle_media_group_file(
+        update,
+        context,
+        file_id=file_id,
+        filename=filename or "audio",
+        file_size=file_size,
+    ):
+        return
+
     # Use the shared pipeline (also used by reply+mention in group chats).
     await _process_audio(
         update,
@@ -3164,6 +3540,7 @@ def main() -> None:
     app.add_handler(CommandHandler("auth", cmd_auth))
     app.add_handler(CommandHandler("llm", cmd_llm))
     app.add_handler(CommandHandler("model", cmd_llm))
+    app.add_handler(CallbackQueryHandler(cb_two_files_choice, pattern=r"^twofiles:"))
     app.add_handler(CallbackQueryHandler(cb_cancel, pattern=r"^cancel:"))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & filters.REPLY, handle_group_tag))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_process_text))

@@ -71,6 +71,10 @@ DEFAULT_AUTH_CODE_TTL_SEC = 15 * 60  # 15 minutes
 DEFAULT_AUTH_CODE_MIN_WORDS = 6
 DEFAULT_AUTH_CODE_MAX_WORDS = 10
 
+# Authorized user LLM preference.
+LLM_PROVIDER_GEMINI = "gemini"
+LLM_PROVIDER_LOCAL = "local"
+
 # Open-source fallback model (Ollama).
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "deepseek-r1:8b"
@@ -368,6 +372,40 @@ def _auth_can_use_gemini(user_id: int, chat_id: int) -> bool:
     return _auth_is_user_authorized(user_id) or _auth_is_chat_whitelisted(chat_id)
 
 
+def _normalize_llm_provider(raw: str) -> Optional[str]:
+    token = (raw or "").strip().lower()
+    if token in {"gemini", "google", "g"}:
+        return LLM_PROVIDER_GEMINI
+    if token in {"local", "ollama", "l"}:
+        return LLM_PROVIDER_LOCAL
+    return None
+
+
+def _auth_get_user_llm_provider(user_id: int) -> str:
+    st = _load_auth_state()
+    rec = (st.get("authorized_users") or {}).get(str(int(user_id)))
+    if not isinstance(rec, dict):
+        return LLM_PROVIDER_GEMINI
+    provider = _normalize_llm_provider(str(rec.get("llm_provider") or ""))
+    return provider or LLM_PROVIDER_GEMINI
+
+
+def _auth_set_user_llm_provider(user_id: int, provider: str) -> bool:
+    normalized = _normalize_llm_provider(provider)
+    if not normalized:
+        return False
+    uid = str(int(user_id))
+    with _AUTH_LOCK:
+        st = _load_auth_state()
+        rec = (st.get("authorized_users") or {}).get(uid)
+        if not isinstance(rec, dict):
+            return False
+        rec["llm_provider"] = normalized
+        rec["llm_provider_updated_at"] = _now_utc_iso()
+        _save_auth_state(st)
+    return True
+
+
 def _auth_maybe_whitelist_chat(*, user_id: int, chat_id: int) -> bool:
     """
     If user is authorized and chat isn't whitelisted yet, add it.
@@ -458,9 +496,13 @@ def _auth_verify_code(user_id: int, text: str) -> tuple[bool, str]:
 
         email = (pending.get("email") or "").strip().lower()
         st["pending"].pop(uid, None)
-        st["authorized_users"][uid] = {"email": email, "authorized_at": _now_utc_iso()}
+        st["authorized_users"][uid] = {
+            "email": email,
+            "authorized_at": _now_utc_iso(),
+            "llm_provider": LLM_PROVIDER_GEMINI,
+        }
         _save_auth_state(st)
-        return True, "✅ Авторизация успешна. Теперь доступна обработка через Gemini."
+        return True, "✅ Авторизация успешна. Теперь доступна обработка через Gemini.\nПереключение LLM: /llm gemini или /llm local."
 
 
 def _smtp_send_email(*, to_email: str, subject: str, body: str) -> None:
@@ -1135,8 +1177,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     domain = _auth_domain()
     intro = (
         "Добро пожаловать в идеальный (ну почти :)) транскрибатор русских аудио сообщений. "
-        "Я использую для транскрибации две SOTA модели: Whisper (medium) и GigaAM, "
-        "Whisper - хорошо распознает смешанный ru/en текст, а GigaAM - лучше русский. "
+        "Я использую для транскрибации две SOTA модели: GigaAM и Whisper (medium), "
+        "GigaAM - лучше русский, а Whisper - хорошо распознает смешанный ru/en текст. "
         "Затем с помощью LLM делаю их сравнительный анализ и итоговый вариант транскрибации. "
         "LLM правит смысловые ошибки, пунктуацию, делает разбивку на абзацы и предложения.\n\n"
         "Бот хорошо подходит для задач, когда важна точность транскрибации, а не скорость: "        
@@ -1229,6 +1271,57 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     mn, mx = _auth_code_word_count()
     await msg.reply_text(f"✅ Письмо отправлено на {email}.\nПришлите сюда код из {mn}-{mx} слов (как в письме).")
+
+
+async def cmd_llm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
+        return
+
+    if not _auth_enabled():
+        await msg.reply_text("Команда доступна только при включенной авторизации (`AUTH_ENABLED=1`).")
+        return
+
+    user_id = int(user.id)
+    if not _auth_is_user_authorized(user_id):
+        domain = _auth_domain()
+        await msg.reply_text(
+            "Команда доступна только авторизованным пользователям.\n"
+            f"Сначала авторизуйтесь: отправьте почту вида `email@{domain}`."
+        )
+        return
+
+    arg = ((context.args or [""])[0] or "").strip().lower()
+    if not arg or arg in {"status", "show"}:
+        current = _auth_get_user_llm_provider(user_id)
+        current_label = "Gemini" if current == LLM_PROVIDER_GEMINI else "Local (Ollama)"
+        gemini_ready = bool((os.environ.get("GEMINI_API_KEY") or "").strip())
+        await msg.reply_text(
+            f"Текущая LLM: {current_label}.\n"
+            "Смена: `/llm gemini` или `/llm local`.\n"
+            f"GEMINI_API_KEY: {'задан' if gemini_ready else 'не задан (при выборе Gemini будет fallback на Local)'}."
+        )
+        return
+
+    target = _normalize_llm_provider(arg)
+    if target is None:
+        await msg.reply_text("Неизвестный вариант. Используйте: `/llm gemini` или `/llm local`.")
+        return
+
+    if not _auth_set_user_llm_provider(user_id, target):
+        await msg.reply_text("Не удалось сохранить выбор LLM. Попробуйте ещё раз.")
+        return
+
+    if target == LLM_PROVIDER_GEMINI:
+        gemini_ready = bool((os.environ.get("GEMINI_API_KEY") or "").strip())
+        if gemini_ready:
+            await msg.reply_text("✅ Выбрана LLM: Gemini.")
+        else:
+            await msg.reply_text("✅ Выбрана LLM: Gemini.\n⚠️ GEMINI_API_KEY не задан, поэтому фактически будет использована Local (Ollama).")
+        return
+
+    await msg.reply_text("✅ Выбрана LLM: Local (Ollama).")
 
 
 async def _begin_email_auth(update: Update, context: ContextTypes.DEFAULT_TYPE, *, email: str) -> None:
@@ -2250,12 +2343,18 @@ async def _process_audio(
                 if whitelisted_now:
                     chat_whitelisted = True
             can_use_gemini = bool(user_id0 and chat_id0 and ((not auth_enabled) or user_authorized or chat_whitelisted))
+            llm_preference = LLM_PROVIDER_GEMINI
+            if auth_enabled and user_authorized and user_id0:
+                llm_preference = _auth_get_user_llm_provider(user_id0)
+            use_gemini = bool(can_use_gemini and gemini_api_key and llm_preference != LLM_PROVIDER_LOCAL)
             session["auth"] = {
                 "enabled": auth_enabled,
                 "user_authorized": user_authorized,
                 "chat_whitelisted": chat_whitelisted,
                 "chat_whitelisted_now": whitelisted_now,
                 "can_use_gemini": can_use_gemini,
+                "llm_preference": llm_preference,
+                "use_gemini": use_gemini,
             }
 
             if user_id0 and not can_use_gemini and _auth_should_prompt_user(user_id0):
@@ -2384,6 +2483,81 @@ async def _process_audio(
                     # Recreate progress message so it stays below the sent audio.
                     await _safe_delete(progress)
                     progress = await reply_target.reply_text(
+                        f"🧠 GigaAM ({gigaam_model}) — распознаю…\n"
+                        "(первый запуск может качать веса)",
+                        reply_markup=markup,
+                    )
+                else:
+                    await _safe_edit_message(
+                        progress,
+                        "✅ WAV готов\n"
+                        f"🧠 GigaAM ({gigaam_model}) — распознаю…\n"
+                        "(первый запуск может качать веса)",
+                        reply_markup=markup,
+                    )
+                ticker_task = None
+                giga_state: Optional[_ProgressState] = None
+                if chat_id is not None:
+                    audio_sec = _wav_duration_sec(wav_path)
+                    giga_state = _ProgressState(audio_sec=audio_sec, est_rtf=_get_rtf_est("gigaam"))
+                    ticker_task = asyncio.create_task(
+                        _ticker(
+                            context=context,
+                            chat_id=chat_id,
+                            message=progress,
+                            base_text=f"🧠 GigaAM ({gigaam_model}) — распознаю…",
+                            reply_markup=markup,
+                            state=giga_state,
+                            cancel_event=cancel_event,
+                        )
+                    )
+                try:
+                    giga = GigaAMTranscriptionService(model_name=gigaam_model, device=device, hf_token=hf_token)
+                    g0 = time.monotonic()
+                    hard_cancel = _truthy_env("GIGAAM_HARD_CANCEL", True)
+                    if hard_cancel:
+                        try:
+                            logging.getLogger("local_telegram_bot").info("GigaAM hard-cancel: enabled (subprocess)")
+                        except Exception:
+                            pass
+                        seg_tuples, _g_info = await _gigaam_transcribe_hard_cancel(
+                            wav_path=wav_path,
+                            model_name=gigaam_model,
+                            device=device,
+                            hf_token=hf_token,
+                            cancel_event=cancel_event,
+                        )
+                        g_segments = [ASRSegment(start=a, end=b, text=t) for (a, b, t) in (seg_tuples or [])]
+                    else:
+                        g_segments, _g_info = await loop.run_in_executor(None, lambda: giga.transcribe(wav_path))
+                    g_wall = time.monotonic() - g0
+                    if giga_state and giga_state.audio_sec > 0:
+                        _update_rtf_est("gigaam", g_wall / giga_state.audio_sec)
+                    session["timings"]["gigaam_sec"] = round(g_wall, 3)
+                    if isinstance(_g_info, dict):
+                        session.setdefault("gigaam", {})["info"] = _g_info
+                finally:
+                    if ticker_task:
+                        ticker_task.cancel()
+                        try:
+                            await ticker_task
+                        except Exception:
+                            pass
+                _check_cancel()
+                g_text = " ".join((s.text or "").strip() for s in g_segments if (s.text or "").strip()).strip()
+                session["results"] = {
+                    "gigaam_len": len(g_text),
+                    "gigaam_segments": len(g_segments or []),
+                }
+
+                giga_sent_to_chat = False
+                if len(g_text) <= TELEGRAM_TEXT_LIMIT:
+                    # Send GigaAM result immediately only when it fits into a regular Telegram message flow.
+                    await _safe_delete(progress)
+                    progress = None
+                    await _reply_long(update, f"GigaAM:\n{g_text or '(пусто)'}")
+                    giga_sent_to_chat = True
+                    progress = await reply_target.reply_text(
                         f"🧠 Whisper ({whisper_model}) — распознаю…\n"
                         "(первый запуск может качать модель; для скорости beam_size=1)",
                         reply_markup=markup,
@@ -2391,11 +2565,12 @@ async def _process_audio(
                 else:
                     await _safe_edit_message(
                         progress,
-                        "✅ WAV готов\n"
+                        "ℹ️ Текст GigaAM слишком длинный для сообщения — отправлю его только файлом.\n"
                         f"🧠 Whisper ({whisper_model}) — распознаю…\n"
                         "(первый запуск может качать модель; для скорости beam_size=1)",
                         reply_markup=markup,
                     )
+
                 cpu_threads = int((os.environ.get("WHISPER_CPU_THREADS") or "").strip() or "0")
                 whisper = TranscriptionService(
                     model_size=whisper_model,
@@ -2487,75 +2662,12 @@ async def _process_audio(
                             pass
                 _check_cancel()
                 w_text = " ".join((s.text or "").strip() for s in w_segments if (s.text or "").strip()).strip()
-                session["results"] = {
-                    "whisper_len": len(w_text),
-                    "whisper_segments": len(w_segments or []),
-                }
-                await _safe_edit_message(
-                    progress,
-                    "✅ Whisper готов\n"
-                    f"🧠 GigaAM ({gigaam_model}) — распознаю…\n"
-                    "(первый запуск может качать веса)",
-                    reply_markup=markup,
-                )
-
-                giga = GigaAMTranscriptionService(model_name=gigaam_model, device=device, hf_token=hf_token)
-                ticker_task = None
-                giga_state: Optional[_ProgressState] = None
-                if chat_id is not None:
-                    audio_sec = _wav_duration_sec(wav_path)
-                    giga_state = _ProgressState(audio_sec=audio_sec, est_rtf=_get_rtf_est("gigaam"))
-                    ticker_task = asyncio.create_task(
-                        _ticker(
-                            context=context,
-                            chat_id=chat_id,
-                            message=progress,
-                            base_text=f"🧠 GigaAM ({gigaam_model}) — распознаю…",
-                            reply_markup=markup,
-                            state=giga_state,
-                            cancel_event=cancel_event,
-                        )
-                    )
-                try:
-                    g0 = time.monotonic()
-                    hard_cancel = _truthy_env("GIGAAM_HARD_CANCEL", True)
-                    if hard_cancel:
-                        try:
-                            logging.getLogger("local_telegram_bot").info("GigaAM hard-cancel: enabled (subprocess)")
-                        except Exception:
-                            pass
-                        seg_tuples, _g_info = await _gigaam_transcribe_hard_cancel(
-                            wav_path=wav_path,
-                            model_name=gigaam_model,
-                            device=device,
-                            hf_token=hf_token,
-                            cancel_event=cancel_event,
-                        )
-                        g_segments = [ASRSegment(start=a, end=b, text=t) for (a, b, t) in (seg_tuples or [])]
-                    else:
-                        g_segments, _g_info = await loop.run_in_executor(None, lambda: giga.transcribe(wav_path))
-                    g_wall = time.monotonic() - g0
-                    if giga_state and giga_state.audio_sec > 0:
-                        _update_rtf_est("gigaam", g_wall / giga_state.audio_sec)
-                    session["timings"]["gigaam_sec"] = round(g_wall, 3)
-                    if isinstance(_g_info, dict):
-                        session.setdefault("gigaam", {})["info"] = _g_info
-                finally:
-                    if ticker_task:
-                        ticker_task.cancel()
-                        try:
-                            await ticker_task
-                        except Exception:
-                            pass
-                _check_cancel()
-                g_text = " ".join((s.text or "").strip() for s in g_segments if (s.text or "").strip()).strip()
                 session["results"].update(
                     {
-                        "gigaam_len": len(g_text),
-                        "gigaam_segments": len(g_segments or []),
+                        "whisper_len": len(w_text),
+                        "whisper_segments": len(w_segments or []),
                     }
                 )
-
                 transcripts_exceed_single_message = (
                     len(w_text) > TELEGRAM_TEXT_LIMIT or len(g_text) > TELEGRAM_TEXT_LIMIT
                 )
@@ -2570,18 +2682,19 @@ async def _process_audio(
                 else:
                     await _safe_delete(progress)
                     progress = None
+                    if not giga_sent_to_chat:
+                        await _reply_long(update, f"GigaAM:\n{g_text or '(пусто)'}")
                     await _reply_long(update, f"Whisper:\n{w_text or '(пусто)'}")
-                    await _reply_long(update, f"GigaAM:\n{g_text or '(пусто)'}")
 
                 final_text = ""
                 final_error = ""
                 final_label = ""
 
                 user_prompt = (
-                    "Whisper:\n"
-                    f"{w_text.strip()}\n\n"
                     "GigaAM:\n"
-                    f"{g_text.strip()}\n"
+                    f"{g_text.strip()}\n\n"
+                    "Whisper:\n"
+                    f"{w_text.strip()}\n"
                 )
 
                 if chat_id is not None:
@@ -2592,7 +2705,7 @@ async def _process_audio(
                         "llm_semaphore", asyncio.Semaphore(_llm_concurrency())
                     )
 
-                    if can_use_gemini and gemini_api_key:
+                    if use_gemini:
                         final_label = f"Gemini ({gemini_model})"
                         progress = await reply_target.reply_text(
                             f"🧠 {final_label} — жду очередь…", reply_markup=markup
@@ -3049,6 +3162,8 @@ def main() -> None:
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("auth", cmd_auth))
+    app.add_handler(CommandHandler("llm", cmd_llm))
+    app.add_handler(CommandHandler("model", cmd_llm))
     app.add_handler(CallbackQueryHandler(cb_cancel, pattern=r"^cancel:"))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & filters.REPLY, handle_group_tag))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_process_text))

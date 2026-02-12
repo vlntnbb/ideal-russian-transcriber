@@ -25,10 +25,9 @@ def render_markdown(
         f"## 1) Итоговый вариант по шаблону ({final_label})\n\n"
         f"{final_block}\n\n"
         "---\n\n"
-        "## 2) Вариант Whisper\n\n"
-        f"{(whisper_text or '').strip()}\n\n"
+        "## 2) Вариант GigaAM\n\n"
+        f"{(gigaam_text or '').strip()}\n\n"
         "---\n\n"
-        "## 3) Вариант GigaAM\n\n"
-        f"{(gigaam_text or '').strip()}\n"
+        "## 3) Вариант Whisper\n\n"
+        f"{(whisper_text or '').strip()}\n"
     )
-

@@ -171,16 +171,32 @@ def run_transcription_job(
     audio_sec = _wav_duration_sec(wav_for_asr)
 
     if dry_run:
-        set_progress(stage="whisper", label="🧠 Whisper — (dry-run)…", percent=0.25, audio_sec=audio_sec, est_total_sec=10.0)
+        set_progress(stage="gigaam", label="🧠 GigaAM — (dry-run)…", percent=0.25, audio_sec=audio_sec, est_total_sec=10.0)
         whisper_text = "[dry-run] whisper transcript"
         gigaam_text = "[dry-run] gigaam transcript"
         whisper_info = {"dry_run": True}
         gigaam_info = {"dry_run": True}
     else:
-        # Whisper progress.
         est_total_sec = max(5.0, audio_sec * 2.5) if audio_sec > 0 else 60.0
         state = _ProgressState(audio_sec=audio_sec, est_total_sec=est_total_sec)
         last_write = 0.0
+
+        set_progress(
+            stage="gigaam",
+            label="🧠 GigaAM — распознаю…",
+            percent=0.15,
+            audio_sec=audio_sec,
+            est_total_sec=max(state.est_total_sec, time.monotonic() - t0 + audio_sec * 1.2),
+        )
+        g0 = time.monotonic()
+        try:
+            gs = GigaAMTranscriptionService(model_name=gigaam_model, device=device, hf_token=hf_token)
+            g_segments, g_info = gs.transcribe(wav_for_asr)
+            gigaam_info = g_info or {}
+            gigaam_text = _segments_text(g_segments)
+        except Exception as exc:
+            errors["gigaam"] = str(exc)
+        timings["gigaam_sec"] = round(time.monotonic() - g0, 3)
 
         def on_whisper_progress(processed: float) -> None:
             nonlocal last_write
@@ -191,8 +207,8 @@ def run_transcription_job(
                 return
             last_write = now
             pct = (state.processed_sec / state.audio_sec) if state.audio_sec > 0 else 0.0
-            # Keep Whisper within 10%..60% segment of the full pipeline.
-            overall = 0.15 + min(0.45, max(0.0, pct) * 0.45)
+            # Keep Whisper within 60%..90% segment of the full pipeline.
+            overall = 0.60 + min(0.30, max(0.0, pct) * 0.30)
             set_progress(
                 stage="whisper",
                 label="🧠 Whisper — распознаю…",
@@ -202,7 +218,7 @@ def run_transcription_job(
                 est_total_sec=state.est_total_sec,
             )
 
-        set_progress(stage="whisper", label="🧠 Whisper — распознаю…", percent=0.15, audio_sec=audio_sec, est_total_sec=est_total_sec)
+        set_progress(stage="whisper", label="🧠 Whisper — распознаю…", percent=0.60, audio_sec=audio_sec, est_total_sec=est_total_sec)
         w0 = time.monotonic()
         try:
             ws = TranscriptionService(model_size=whisper_model, device=device, language=language)
@@ -212,17 +228,6 @@ def run_transcription_job(
         except Exception as exc:
             errors["whisper"] = str(exc)
         timings["whisper_sec"] = round(time.monotonic() - w0, 3)
-
-        set_progress(stage="gigaam", label="🧠 GigaAM — распознаю…", percent=0.65, audio_sec=audio_sec, est_total_sec=max(state.est_total_sec, time.monotonic() - t0 + audio_sec * 1.2))
-        g0 = time.monotonic()
-        try:
-            gs = GigaAMTranscriptionService(model_name=gigaam_model, device=device, hf_token=hf_token)
-            g_segments, g_info = gs.transcribe(wav_for_asr)
-            gigaam_info = g_info or {}
-            gigaam_text = _segments_text(g_segments)
-        except Exception as exc:
-            errors["gigaam"] = str(exc)
-        timings["gigaam_sec"] = round(time.monotonic() - g0, 3)
 
     set_progress(stage="write_asr", label="💾 Сохраняю результаты ASR…", percent=0.75, audio_sec=audio_sec)
     whisper_text_path = str((outp / "whisper.txt").resolve())
@@ -235,7 +240,7 @@ def run_transcription_job(
     gigaam_json_path = str((outp / "gigaam.json").resolve())
     (outp / "gigaam.json").write_text(json.dumps(gigaam_info, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    user_prompt = f"Whisper:\n{(whisper_text or '').strip()}\n\nGigaAM:\n{(gigaam_text or '').strip()}\n"
+    user_prompt = f"GigaAM:\n{(gigaam_text or '').strip()}\n\nWhisper:\n{(whisper_text or '').strip()}\n"
 
     llm_result: Optional[LLMResult] = None
     final_text = ""

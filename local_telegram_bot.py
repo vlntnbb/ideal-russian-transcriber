@@ -43,7 +43,7 @@ from snapscript.core.audio_processor import (
 from snapscript.utils.logging_utils import setup_logging
 from transcribe_core.markdown import render_markdown
 
-# Prevent multiple polling instances in the same repo (avoids Telegram getUpdates Conflict).
+# Prevent duplicate local_telegram_bot polling instances (avoids Telegram getUpdates Conflict).
 def _acquire_bot_lock(lock_path: str) -> None:
     import fcntl
 
@@ -3505,7 +3505,7 @@ def main() -> None:
     logging.getLogger("snapscript").setLevel(logging.INFO)
 
     logging.getLogger("local_telegram_bot").info("Python exe=%s prefix=%s", sys.executable, sys.prefix)
-    _acquire_bot_lock(os.path.join(os.path.dirname(__file__), ".bot.lock"))
+    _acquire_bot_lock(os.path.join(os.path.dirname(__file__), ".local_telegram_bot.lock"))
 
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:

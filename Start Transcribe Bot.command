@@ -12,12 +12,6 @@ if pgrep -f "[l]ocal_telegram_bot.py" >/dev/null 2>&1; then
   exit 0
 fi
 
-if pgrep -f "[c]ontent_agent_bot.py" >/dev/null 2>&1; then
-  echo "Нельзя запустить local_telegram_bot.py: запущен content_agent_bot.py (общий lock .bot.lock)."
-  echo "Остановите content-бота и запустите этот файл снова."
-  exit 1
-fi
-
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "Не найден Python в .venv: $PYTHON_BIN"
   echo "Создайте окружение и установите зависимости:"

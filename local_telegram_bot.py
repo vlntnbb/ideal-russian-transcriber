@@ -82,8 +82,8 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "deepseek-r1:8b"
 DEFAULT_AUDIO_NORMALIZE_KEY = "norm,норм"
 DEFAULT_AUDIO_NORMALIZE_FILTER = "adeclick,dynaudnorm=f=500:g=11:p=0.95:m=20"
-TWO_FILE_MEDIA_GROUP_WAIT_SEC = 1.2
-TWO_FILE_CHOICE_TTL_SEC = 5 * 60
+MEDIA_GROUP_WAIT_SEC = 1.2
+MEDIA_GROUP_CHOICE_TTL_SEC = 5 * 60
 
 _USAGE_LOGGER: Optional[logging.Logger] = None
 
@@ -724,11 +724,11 @@ def _cancel_markup(session_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def _two_file_choice_markup(token: str) -> InlineKeyboardMarkup:
+def _media_group_choice_markup(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("По-отдельности", callback_data=f"twofiles:sep:{token}")],
-            [InlineKeyboardButton("Склеить в один", callback_data=f"twofiles:merge:{token}")],
+            [InlineKeyboardButton("По-отдельности", callback_data=f"mediagroup:sep:{token}")],
+            [InlineKeyboardButton("Склеить и как один", callback_data=f"mediagroup:merge:{token}")],
         ]
     )
 
@@ -749,23 +749,23 @@ def _asr_state_lock(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Lock:
     return context.application.bot_data.setdefault("asr_state_lock", asyncio.Lock())
 
 
-def _two_file_state_lock(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Lock:
-    return context.application.bot_data.setdefault("two_file_state_lock", asyncio.Lock())
+def _media_group_state_lock(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Lock:
+    return context.application.bot_data.setdefault("media_group_state_lock", asyncio.Lock())
 
 
 def _pending_media_groups(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.application.bot_data.setdefault("pending_media_groups", {})
 
 
-def _pending_two_file_choices(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    return context.application.bot_data.setdefault("pending_two_file_choices", {})
+def _pending_media_group_choices(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.application.bot_data.setdefault("pending_media_group_choices", {})
 
 
-def _cleanup_two_file_choices(choices: dict) -> None:
+def _cleanup_media_group_choices(choices: dict) -> None:
     now = time.monotonic()
     for token, payload in list(choices.items()):
         created = float((payload or {}).get("created_monotonic") or 0.0)
-        if created <= 0 or (now - created) > TWO_FILE_CHOICE_TTL_SEC:
+        if created <= 0 or (now - created) > MEDIA_GROUP_CHOICE_TTL_SEC:
             choices.pop(token, None)
 
 
@@ -1161,8 +1161,8 @@ async def _run_items_separately(
         )
 
 
-async def _run_two_items_merged(context: ContextTypes.DEFAULT_TYPE, *, items: list[dict]) -> None:
-    if len(items) != 2:
+async def _run_items_merged(context: ContextTypes.DEFAULT_TYPE, *, items: list[dict]) -> None:
+    if len(items) < 2:
         await _run_items_separately(context, items=items)
         return
 
@@ -1172,10 +1172,12 @@ async def _run_two_items_merged(context: ContextTypes.DEFAULT_TYPE, *, items: li
     if reply_target is None:
         await _run_items_separately(context, items=ordered)
         return
+    total = len(ordered)
+    file_word = _ru_plural(total, "файл", "файла", "файлов")
     status = None
     try:
         if reply_target is not None:
-            status = await reply_target.reply_text("📎 Склеиваю 2 файла в один…")
+            status = await reply_target.reply_text(f"📎 Склеиваю {total} {file_word} в один…")
 
         with tempfile.TemporaryDirectory(prefix="tg_asr_merge2_") as td:
             ap = AudioProcessor()
@@ -1185,14 +1187,14 @@ async def _run_two_items_merged(context: ContextTypes.DEFAULT_TYPE, *, items: li
 
             for idx, item in enumerate(ordered, start=1):
                 if status is not None:
-                    await _safe_edit(status, f"📥 Скачиваю файл {idx}/2…")
+                    await _safe_edit(status, f"📥 Скачиваю файл {idx}/{total}…")
                 tg_file = await context.bot.get_file(str(item["file_id"]))
                 safe_name = _sanitize_filename(item.get("filename"), fallback=f"part{idx}.bin")
                 src_path = os.path.join(td, f"{idx}_{safe_name}")
                 await tg_file.download_to_drive(custom_path=src_path)
                 total_size += int(item.get("source_file_size") or 0)
                 if status is not None:
-                    await _safe_edit(status, f"🎛 Готовлю WAV для файла {idx}/2…")
+                    await _safe_edit(status, f"🎛 Готовлю WAV для файла {idx}/{total}…")
                 wav_path = await loop.run_in_executor(None, lambda p=src_path: ap.extract_audio(p, output_dir=td))
                 wav_parts.append(wav_path)
 
@@ -1205,23 +1207,23 @@ async def _run_two_items_merged(context: ContextTypes.DEFAULT_TYPE, *, items: li
             await _process_audio(
                 first["update"],
                 context,
-                file_id=f"merged:{ordered[0]['file_id']}+{ordered[1]['file_id']}",
+                file_id=f"merged:{total}:{uuid.uuid4().hex[:8]}",
                 filename="merged_input.wav",
                 reply_target=reply_target,
                 source_message_id=first.get("source_message_id"),
                 source_file_size=(total_size or None),
-                normalize_audio=bool(first.get("normalize_audio")) or bool(ordered[1].get("normalize_audio")),
+                normalize_audio=any(bool(item.get("normalize_audio")) for item in ordered),
                 local_source_path=merged_input,
                 working_dir=td,
             )
     except Exception as exc:
         await _safe_delete(status)
         if reply_target is not None:
-            await reply_target.reply_text(f"Ошибка при склейке двух файлов: {str(exc).strip() or exc.__class__.__name__}")
+            await reply_target.reply_text(f"Ошибка при склейке файлов: {str(exc).strip() or exc.__class__.__name__}")
 
 
-async def _offer_two_file_choice(context: ContextTypes.DEFAULT_TYPE, *, items: list[dict]) -> None:
-    if len(items) != 2:
+async def _offer_media_group_choice(context: ContextTypes.DEFAULT_TYPE, *, items: list[dict]) -> None:
+    if len(items) < 2:
         await _run_items_separately(context, items=items)
         return
 
@@ -1232,20 +1234,25 @@ async def _offer_two_file_choice(context: ContextTypes.DEFAULT_TYPE, *, items: l
         await _run_items_separately(context, items=ordered)
         return
 
+    total = len(ordered)
+    file_word = _ru_plural(total, "файл", "файла", "файлов")
     token = secrets.token_urlsafe(8)
     try:
         prompt = await reply_target.reply_text(
-            "Получил 2 файла одновременно.\nКак обработать?",
-            reply_markup=_two_file_choice_markup(token),
+            f"Получил {total} {file_word} одновременно.\n"
+            "Как обработать?\n"
+            "• Вместе: склеить в одну длинную запись и транскрибировать как один файл.\n"
+            "• По-отдельности: обработать каждый файл отдельно.",
+            reply_markup=_media_group_choice_markup(token),
         )
     except Exception:
         await _run_items_separately(context, items=ordered)
         return
 
-    lock = _two_file_state_lock(context)
+    lock = _media_group_state_lock(context)
     async with lock:
-        choices = _pending_two_file_choices(context)
-        _cleanup_two_file_choices(choices)
+        choices = _pending_media_group_choices(context)
+        _cleanup_media_group_choices(choices)
         choices[token] = {
             "items": ordered,
             "chat_id": int(getattr(getattr(first.get("update"), "effective_chat", None), "id", 0) or 0),
@@ -1255,10 +1262,10 @@ async def _offer_two_file_choice(context: ContextTypes.DEFAULT_TYPE, *, items: l
         }
 
 
-async def _finalize_media_group_pair(context: ContextTypes.DEFAULT_TYPE, *, key: str) -> None:
+async def _finalize_media_group(context: ContextTypes.DEFAULT_TYPE, *, key: str) -> None:
     try:
-        await asyncio.sleep(TWO_FILE_MEDIA_GROUP_WAIT_SEC)
-        lock = _two_file_state_lock(context)
+        await asyncio.sleep(MEDIA_GROUP_WAIT_SEC)
+        lock = _media_group_state_lock(context)
         async with lock:
             pending = _pending_media_groups(context)
             group = pending.pop(key, None)
@@ -1266,20 +1273,12 @@ async def _finalize_media_group_pair(context: ContextTypes.DEFAULT_TYPE, *, key:
             return
 
         items = list(group.get("items") or [])
-        if len(items) == 2:
-            await _offer_two_file_choice(context, items=items)
+        if len(items) >= 2:
+            await _offer_media_group_choice(context, items=items)
             return
 
         if len(items) >= 1:
-            await _run_items_separately(
-                context,
-                items=items,
-                announce_text=(
-                    f"Получил {len(items)} файла одновременно — обработаю их по-отдельности."
-                    if len(items) > 1
-                    else None
-                ),
-            )
+            await _run_items_separately(context, items=items)
     except Exception:
         logging.getLogger("local_telegram_bot").exception("Failed to finalize media-group files")
 
@@ -1314,7 +1313,7 @@ async def _handle_media_group_file(
     key = f"{chat_id}:{media_group_id}"
 
     should_start_task = False
-    lock = _two_file_state_lock(context)
+    lock = _media_group_state_lock(context)
     async with lock:
         pending = _pending_media_groups(context)
         group = pending.get(key)
@@ -1335,8 +1334,8 @@ async def _handle_media_group_file(
         should_start_task = group.get("task") is None
 
     if should_start_task:
-        t = asyncio.create_task(_finalize_media_group_pair(context, key=key))
-        lock = _two_file_state_lock(context)
+        t = asyncio.create_task(_finalize_media_group(context, key=key))
+        lock = _media_group_state_lock(context)
         async with lock:
             group = _pending_media_groups(context).get(key)
             if group is not None and group.get("task") is None:
@@ -1344,12 +1343,12 @@ async def _handle_media_group_file(
     return True
 
 
-async def cb_two_files_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cb_media_group_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = getattr(update, "callback_query", None)
     if not q or not getattr(q, "data", None):
         return
     data = str(q.data)
-    if not data.startswith("twofiles:"):
+    if not (data.startswith("mediagroup:") or data.startswith("twofiles:")):
         return
 
     parts = data.split(":", 2)
@@ -1361,10 +1360,10 @@ async def cb_two_files_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     current_user_id = int(getattr(getattr(update, "effective_user", None), "id", 0) or 0)
     payload = None
-    lock = _two_file_state_lock(context)
+    lock = _media_group_state_lock(context)
     async with lock:
-        choices = _pending_two_file_choices(context)
-        _cleanup_two_file_choices(choices)
+        choices = _pending_media_group_choices(context)
+        _cleanup_media_group_choices(choices)
         candidate = choices.get(token)
         expected_user_id = int((candidate or {}).get("user_id") or 0)
         if not candidate:
@@ -1392,16 +1391,24 @@ async def cb_two_files_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
     try:
+        items = list((payload or {}).get("items") or [])
+        total = len(items)
+        file_word = _ru_plural(total, "файл", "файла", "файлов")
         if mode == "merge":
-            await q.message.edit_text("Выбрано: склеить 2 файла и обработать как один.", reply_markup=None)
+            await q.message.edit_text(
+                f"Выбрано: склеить {total} {file_word} и обработать как один.",
+                reply_markup=None,
+            )
         else:
-            await q.message.edit_text("Выбрано: обработать 2 файла по-отдельности.", reply_markup=None)
+            await q.message.edit_text(
+                f"Выбрано: обработать {total} {file_word} по-отдельности.",
+                reply_markup=None,
+            )
     except Exception:
         pass
 
-    items = list((payload or {}).get("items") or [])
     if mode == "merge":
-        await _run_two_items_merged(context, items=items)
+        await _run_items_merged(context, items=items)
     else:
         await _run_items_separately(context, items=items)
 
@@ -1536,7 +1543,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     privacy_block = (
         "Политика конфиденциальности:\n"
-        "- Бот не сохраняет текст транскрибации и LLM-промпты; в usage-лог попадают только метаданные (например, username/ID пользователя и ID чата).\n"
+        "- Бот не сохраняет текст транскрибации и LLM-промпты; в usage-лог попадают только метаданные (username/ID пользователя и ID чата).\n"
         "- Для внешних пользователей используется локальная LLM на моем компьютере и ваши аудио и тексты нигде не сохраняются.\n"
         "- Запросы сотрудников Business Booster обрабатывает Gemini 3 Pro в нашем корпоративном аккаунте.\n\n"
     )
@@ -1553,7 +1560,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "тогда вам будет доступна более качественная платная модель Gemini 3 Pro.\n\n"
             f"Просто отправьте мне вашу почту вида `email@{domain}`.\n\n"
             "Если вы гость, то можете использовать бот бесплатно на локальной модели "
-            "(это значительно медленнее и чуть менее точно, но тоже неплохо)."
+            "(это немного медленнее и чуть менее точно, но тоже неплохо)."
         )
     else:
         auth_block = (
@@ -3252,7 +3259,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text("Пришлите voice/audio/video файл.")
         return
 
-    # In private chats, collect media-group items and offer "separate vs merged" for 2 files.
+    # In private chats, collect media-group items and offer "separate vs merged" for 2+ files.
     if await _handle_media_group_file(
         update,
         context,
@@ -3540,7 +3547,7 @@ def main() -> None:
     app.add_handler(CommandHandler("auth", cmd_auth))
     app.add_handler(CommandHandler("llm", cmd_llm))
     app.add_handler(CommandHandler("model", cmd_llm))
-    app.add_handler(CallbackQueryHandler(cb_two_files_choice, pattern=r"^twofiles:"))
+    app.add_handler(CallbackQueryHandler(cb_media_group_choice, pattern=r"^(mediagroup|twofiles):"))
     app.add_handler(CallbackQueryHandler(cb_cancel, pattern=r"^cancel:"))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & filters.REPLY, handle_group_tag))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_process_text))

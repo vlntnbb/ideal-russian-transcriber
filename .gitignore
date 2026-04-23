@@ -54,3 +54,8 @@ models/
 
 # GigaAM cache (по умолчанию)
 **/.cache/gigaam/
+
+# Swift / Xcode
+swift_app/.build/
+swift_app/.swiftpm/
+DerivedData/

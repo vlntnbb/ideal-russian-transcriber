@@ -699,7 +699,7 @@ def _default_whisper_timeout_sec(*, audio_sec: float) -> float:
     audio_sec = float(audio_sec or 0.0)
     rtf = _get_rtf_est("whisper") or 0.0
     if rtf <= 0:
-        # Conservative fallback (CPU medium can be slow on some machines).
+        # Conservative fallback (CPU Whisper can be slow on some machines).
         rtf = 0.6
     est = max(60.0, audio_sec * rtf)
     # Give extra slack for warmup/IO and variability.
@@ -1264,11 +1264,20 @@ async def _offer_media_group_choice(context: ContextTypes.DEFAULT_TYPE, *, items
 
 async def _finalize_media_group(context: ContextTypes.DEFAULT_TYPE, *, key: str) -> None:
     try:
-        await asyncio.sleep(MEDIA_GROUP_WAIT_SEC)
         lock = _media_group_state_lock(context)
-        async with lock:
-            pending = _pending_media_groups(context)
-            group = pending.pop(key, None)
+        group = None
+        while True:
+            await asyncio.sleep(MEDIA_GROUP_WAIT_SEC)
+            async with lock:
+                pending = _pending_media_groups(context)
+                candidate = pending.get(key)
+                if not candidate:
+                    return
+                last_item = float((candidate or {}).get("last_item_monotonic") or 0.0)
+                if last_item <= 0 or (time.monotonic() - last_item) >= MEDIA_GROUP_WAIT_SEC:
+                    group = pending.pop(key, None)
+                    break
+
         if not group:
             return
 
@@ -1323,6 +1332,7 @@ async def _handle_media_group_file(
                 "media_group_id": str(media_group_id),
                 "items": [],
                 "created_monotonic": time.monotonic(),
+                "last_item_monotonic": time.monotonic(),
                 "task": None,
             }
             pending[key] = group
@@ -1331,6 +1341,7 @@ async def _handle_media_group_file(
         exists = any(int((it or {}).get("source_message_id") or 0) == msg_id for it in (group.get("items") or []))
         if not exists:
             group["items"].append(item)
+        group["last_item_monotonic"] = time.monotonic()
         should_start_task = group.get("task") is None
 
     if should_start_task:
@@ -1533,7 +1544,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     domain = _auth_domain()
     intro = (
         "Добро пожаловать в идеальный (ну почти :)) транскрибатор русских аудио сообщений. "
-        "Я использую для транскрибации две SOTA модели: GigaAM и Whisper (medium), "
+        "Я использую для транскрибации две SOTA модели: GigaAM и Whisper (large-v3-turbo), "
         "GigaAM - лучше русский, а Whisper - хорошо распознает смешанный ru/en текст. "
         "Затем с помощью LLM делаю их сравнительный анализ и итоговый вариант транскрибации. "
         "LLM правит смысловые ошибки, пунктуацию, делает разбивку на абзацы и предложения.\n\n"
@@ -1773,6 +1784,53 @@ def _pick_telegram_file_from_message(msg):
         return msg.document.file_id, name, msg.document.file_size
 
     return None, None, None
+
+
+def _message_media_summary(msg) -> dict:
+    if msg is None:
+        return {}
+    doc = getattr(msg, "document", None)
+    audio = getattr(msg, "audio", None)
+    video = getattr(msg, "video", None)
+    voice = getattr(msg, "voice", None)
+    video_note = getattr(msg, "video_note", None)
+    return {
+        "voice": bool(voice),
+        "audio": bool(audio),
+        "video": bool(video),
+        "video_note": bool(video_note),
+        "document": bool(doc),
+        "document_mime": (getattr(doc, "mime_type", None) or None) if doc else None,
+        "document_name": (getattr(doc, "file_name", None) or None) if doc else None,
+        "audio_mime": (getattr(audio, "mime_type", None) or None) if audio else None,
+        "audio_name": (getattr(audio, "file_name", None) or None) if audio else None,
+        "video_mime": (getattr(video, "mime_type", None) or None) if video else None,
+        "caption": (getattr(msg, "caption", None) or None),
+    }
+
+
+def _looks_like_audio_or_video_document(msg) -> bool:
+    doc = getattr(msg, "document", None)
+    if not doc:
+        return False
+    mime = str(getattr(doc, "mime_type", "") or "").lower()
+    if mime.startswith("audio/") or mime.startswith("video/"):
+        return True
+    name = str(getattr(doc, "file_name", "") or "").lower()
+    return name.endswith((
+        ".mp3",
+        ".wav",
+        ".m4a",
+        ".ogg",
+        ".opus",
+        ".aac",
+        ".flac",
+        ".mp4",
+        ".mov",
+        ".mkv",
+        ".webm",
+        ".avi",
+    ))
 
 
 def _telegram_max_get_file_bytes() -> int:
@@ -2669,7 +2727,7 @@ async def _process_audio(
             "status": "started",
         }
         try:
-            whisper_model = _get_env("WHISPER_MODEL", "medium")
+            whisper_model = _get_env("WHISPER_MODEL", "large-v3-turbo")
             gigaam_model = _get_env("GIGAAM_MODEL", "v3_e2e_rnnt")
             device = _get_env("DEVICE", "cpu")
             language = _get_env("LANGUAGE", "ru")
@@ -3250,13 +3308,47 @@ async def _process_audio(
         await _asr_active_dec(context)
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    try:
+        logging.getLogger("local_telegram_bot").info(
+            "Incoming media update chat=%s user=%s msg=%s media_group=%s summary=%s",
+            getattr(getattr(update, "effective_chat", None), "id", None),
+            getattr(getattr(update, "effective_user", None), "id", None),
+            getattr(msg, "message_id", None),
+            getattr(msg, "media_group_id", None),
+            _message_media_summary(msg),
+        )
+    except Exception:
+        pass
+
     # In groups, process only via reply+mention flow to avoid accidental triggers/spam.
     if _is_group_chat(update):
+        try:
+            logging.getLogger("local_telegram_bot").info(
+                "Skipping direct media in group chat=%s msg=%s (requires reply+mention flow).",
+                getattr(getattr(update, "effective_chat", None), "id", None),
+                getattr(msg, "message_id", None),
+            )
+        except Exception:
+            pass
         return
 
     file_id, filename, file_size = _pick_telegram_file(update)
     if not file_id:
-        await update.effective_message.reply_text("Пришлите voice/audio/video файл.")
+        try:
+            logging.getLogger("local_telegram_bot").warning(
+                "Media update has no supported file_id chat=%s user=%s msg=%s summary=%s",
+                getattr(getattr(update, "effective_chat", None), "id", None),
+                getattr(getattr(update, "effective_user", None), "id", None),
+                getattr(msg, "message_id", None),
+                _message_media_summary(msg),
+            )
+        except Exception:
+            pass
+        await update.effective_message.reply_text(
+            "Пришлите voice/audio/video файл.\n"
+            "Если отправляете как документ, убедитесь, что это audio/video с корректным MIME."
+        )
         return
 
     # In private chats, collect media-group items and offer "separate vs merged" for 2+ files.
@@ -3267,6 +3359,17 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         filename=filename or "audio",
         file_size=file_size,
     ):
+        try:
+            logging.getLogger("local_telegram_bot").info(
+                "Queued media-group item chat=%s msg=%s media_group=%s filename=%s size=%s",
+                getattr(getattr(update, "effective_chat", None), "id", None),
+                getattr(msg, "message_id", None),
+                getattr(msg, "media_group_id", None),
+                filename,
+                file_size,
+            )
+        except Exception:
+            pass
         return
 
     # Use the shared pipeline (also used by reply+mention in group chats).
@@ -3281,216 +3384,37 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     return
 
-    sem: asyncio.Semaphore = context.application.bot_data.setdefault(
-        "asr_semaphore", asyncio.Semaphore(_asr_concurrency())
-    )
-    async with sem:
+
+async def handle_unhandled_private_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _ = context
+    msg = update.effective_message
+    if msg is None:
+        return
+    if _is_group_chat(update):
+        return
+
+    # This runs after specific media handlers and helps diagnose unsupported attachments.
+    summary = _message_media_summary(msg)
+    try:
+        logging.getLogger("local_telegram_bot").warning(
+            "Unhandled private attachment chat=%s user=%s msg=%s media_group=%s summary=%s",
+            getattr(getattr(update, "effective_chat", None), "id", None),
+            getattr(getattr(update, "effective_user", None), "id", None),
+            getattr(msg, "message_id", None),
+            getattr(msg, "media_group_id", None),
+            summary,
+        )
+    except Exception:
+        pass
+
+    if _looks_like_audio_or_video_document(msg):
         try:
-            whisper_model = _get_env("WHISPER_MODEL", "medium")
-            gigaam_model = _get_env("GIGAAM_MODEL", "v3_e2e_rnnt")
-            device = _get_env("DEVICE", "cpu")
-            language = _get_env("LANGUAGE", "ru")
-            hf_token: Optional[str] = (os.environ.get("HF_TOKEN") or "").strip() or None
-            gemini_api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-            gemini_model = (os.environ.get("GEMINI_MODEL") or "gemini-3-pro-preview").strip()
-            gemini_system_prompt, _prompt_src = _get_system_prompt()
-
-            # Single "status/progress" message. It is recreated between stages so it's always below previously sent text.
-            progress = await update.effective_message.reply_text("Старт…")
-            chat_id = int(update.effective_chat.id) if update.effective_chat else None
-
-            await _safe_edit(progress, "📥 Скачиваю аудио…")
-            tg_file = await context.bot.get_file(file_id)
-
-            with tempfile.TemporaryDirectory(prefix="tg_asr_") as td:
-                src_path = os.path.join(td, filename)
-                wav_dir = td
-
-                await tg_file.download_to_drive(custom_path=src_path)
-
-                ap = AudioProcessor()
-                loop = asyncio.get_running_loop()
-
-                await _safe_edit(progress, "✅ Аудио скачано\n🎛 Готовлю WAV (16kHz mono)…")
-                wav_path = await loop.run_in_executor(None, lambda: ap.extract_audio(src_path, output_dir=wav_dir))
-
-                await _safe_edit(
-                    progress,
-                    "✅ WAV готов\n"
-                    f"🧠 Whisper ({whisper_model}) — распознаю…\n"
-                    "(первый запуск может качать модель; для скорости beam_size=1)",
-                )
-                cpu_threads = int((os.environ.get("WHISPER_CPU_THREADS") or "").strip() or "0")
-                whisper = TranscriptionService(
-                    model_size=whisper_model,
-                    device=device,
-                    language=language,
-                    cpu_threads=cpu_threads,
-                )
-                ticker_task = None
-                whisper_state: Optional[_ProgressState] = None
-                if chat_id is not None:
-                    audio_sec = _wav_duration_sec(wav_path)
-                    whisper_state = _ProgressState(audio_sec=audio_sec, est_rtf=_get_rtf_est("whisper"))
-                    ticker_task = asyncio.create_task(
-                        _ticker(
-                            context=context,
-                            chat_id=chat_id,
-                            message=progress,
-                            base_text=f"🧠 Whisper ({whisper_model}) — распознаю…",
-                            state=whisper_state,
-                        )
-                    )
-                try:
-                    whisper_timeout = int((os.environ.get("WHISPER_TIMEOUT_SEC") or "").strip() or "240")
-                    w0 = time.monotonic()
-                    w_segments, _w_info = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            None,
-                            lambda: whisper.transcribe(
-                                wav_path,
-                                progress_cb=(whisper_state.set_processed_sec if whisper_state else None),
-                            ),
-                        ),
-                        timeout=float(max(10, whisper_timeout)),
-                    )
-                    w_wall = time.monotonic() - w0
-                    if whisper_state and whisper_state.audio_sec > 0:
-                        _update_rtf_est("whisper", w_wall / whisper_state.audio_sec)
-                finally:
-                    if ticker_task:
-                        ticker_task.cancel()
-                        try:
-                            await ticker_task
-                        except Exception:
-                            pass
-                w_text = " ".join((s.text or "").strip() for s in w_segments if (s.text or "").strip()).strip()
-                await _reply_long(update, f"Whisper:\n{w_text or '(пусто)'}")
-
-                # Recreate status message so it stays below the Whisper output.
-                await _safe_delete(progress)
-                progress = await update.effective_message.reply_text(
-                    f"🧠 GigaAM ({gigaam_model}) — распознаю…\n(первый запуск может качать веса)"
-                )
-
-                await _safe_edit(
-                    progress,
-                    f"🧠 GigaAM ({gigaam_model}) — распознаю…\n(первый запуск может качать веса)",
-                )
-                giga = GigaAMTranscriptionService(model_name=gigaam_model, device=device, hf_token=hf_token)
-                ticker_task = None
-                giga_state: Optional[_ProgressState] = None
-                if chat_id is not None:
-                    audio_sec = _wav_duration_sec(wav_path)
-                    giga_state = _ProgressState(audio_sec=audio_sec, est_rtf=_get_rtf_est("gigaam"))
-                    ticker_task = asyncio.create_task(
-                        _ticker(
-                            context=context,
-                            chat_id=chat_id,
-                            message=progress,
-                            base_text=f"🧠 GigaAM ({gigaam_model}) — распознаю…",
-                            state=giga_state,
-                        )
-                    )
-                try:
-                    g0 = time.monotonic()
-                    g_segments, _g_info = await loop.run_in_executor(None, lambda: giga.transcribe(wav_path))
-                    g_wall = time.monotonic() - g0
-                    if giga_state and giga_state.audio_sec > 0:
-                        _update_rtf_est("gigaam", g_wall / giga_state.audio_sec)
-                finally:
-                    if ticker_task:
-                        ticker_task.cancel()
-                        try:
-                            await ticker_task
-                        except Exception:
-                            pass
-                g_text = " ".join((s.text or "").strip() for s in g_segments if (s.text or "").strip()).strip()
-                await _reply_long(update, f"GigaAM:\n{g_text or '(пусто)'}")
-
-                # Gemini post-processing (default pipeline) → markdown file.
-                gemini_text = ""
-                gemini_error = ""
-                if gemini_api_key and chat_id is not None:
-                    # Recreate status message so Gemini thoughts are always below the GigaAM output.
-                    await _safe_delete(progress)
-                    progress = await update.effective_message.reply_text(
-                        f"🧠 Gemini ({gemini_model}) — думаю над итогом…"
-                    )
-
-                    async def on_update(thoughts: str, elapsed_sec: float) -> None:
-                        body = _trim_for_telegram(thoughts or "(пока без мыслей)")
-                        body_html = _markdown_bold_lines_to_html(body)
-                        text_html = (
-                            f"🧠 Gemini ({_html.escape(gemini_model)}) — думаю над итогом…\n"
-                            f"⏱ {_html.escape(_fmt_dur(elapsed_sec))}\n\n"
-                            f"{body_html}"
-                        )
-                        await _safe_edit_formatted(progress, text_html, parse_mode=ParseMode.HTML)
-                        try:
-                            await context.bot.send_chat_action(chat_id=int(chat_id), action=ChatAction.TYPING)
-                        except Exception:
-                            pass
-
-                    system_prompt = gemini_system_prompt
-                    user_prompt = (
-                        "Whisper:\n"
-                        f"{w_text.strip()}\n\n"
-                        "GigaAM:\n"
-                        f"{g_text.strip()}\n"
-                    )
-                    generation_config = {
-                        "temperature": _parse_float_env(os.environ.get("GEMINI_TEMPERATURE") or "1", 1.0),
-                        "topP": _parse_float_env(os.environ.get("GEMINI_TOP_P") or "0.95", 0.95),
-                        "maxOutputTokens": _parse_int_env(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS") or "65536", 65536),
-                        "mediaResolution": _media_resolution_value(os.environ.get("GEMINI_MEDIA_RESOLUTION") or "default"),
-                        "thinkingConfig": {
-                            "thinkingLevel": _thinking_level_value(os.environ.get("GEMINI_THINKING_LEVEL") or "high"),
-                            "includeThoughts": True,
-                        },
-                    }
-                    try:
-                        gemini_text = await _gemini_stream_generate(
-                            api_key=gemini_api_key,
-                            model=gemini_model,
-                            prompt=user_prompt,
-                            system_prompt=system_prompt,
-                            generation_config=generation_config,
-                            on_update=on_update,
-                        )
-                    except Exception as exc:
-                        logging.getLogger("local_telegram_bot").exception("Gemini default processing failed")
-                        gemini_error = str(exc)
-                elif not gemini_api_key:
-                    gemini_error = "GEMINI_API_KEY не задан — пропускаю обработку Gemini."
-
-                # Send markdown file in requested order.
-                if progress:
-                    await _safe_edit(progress, "📄 Формирую итоговый файл…")
-
-                # Also send the final Gemini block as a chat message (then the file).
-                if gemini_text:
-                    chat_text = _gemini_chat_excerpt(gemini_text)
-                    if chat_text.strip():
-                        await _reply_long_html(update, _markdown_to_telegram_html(chat_text.strip()))
-                elif gemini_error:
-                    await update.effective_message.reply_text(f"Gemini: ошибка/пропуск: {gemini_error}")
-
-                await _send_markdown_file(
-                    update,
-                    final_text=gemini_text,
-                    final_error=gemini_error,
-                    final_label=f"Gemini ({gemini_model})",
-                    whisper_text=w_text,
-                    gigaam_text=g_text,
-                )
-
-                await _safe_delete(progress)
-                await update.effective_message.reply_text("✅ Готово")
-
-        except Exception as exc:
-            logging.exception("ASR failed")
-            await update.effective_message.reply_text(f"Ошибка: {exc}")
+            await msg.reply_text(
+                "Похоже, это аудио/видео-документ в неподдерживаемом формате метаданных.\n"
+                "Попробуйте отправить как voice/audio/video, либо переэкспортировать файл."
+            )
+        except Exception:
+            pass
 
 
 def main() -> None:
@@ -3562,6 +3486,7 @@ def main() -> None:
             handle_audio,
         )
     )
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.ATTACHMENT, handle_unhandled_private_attachment))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

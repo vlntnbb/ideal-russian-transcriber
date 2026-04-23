@@ -2,6 +2,8 @@
 
 В этом репозитории есть:
 - `local_telegram_bot.py` — локальный Telegram-бот: принимает voice/audio/video, делает 2 транскрипции (GigaAM + Whisper) и формирует итог по шаблону через LLM
+- `transcribe_batch_cli.py` — batch CLI для пачки файлов (режим `separate` или `merge`)
+- `swift_app/` — macOS SwiftUI приложение поверх текущего Python пайплайна
 - `snapscript/` — обёртки для подготовки аудио и ASR
 
 ## Требования
@@ -137,6 +139,51 @@ CLI создаёт в `--out`:
 - `gigaam.txt` / `gigaam.json`
 - `transcript.md` — итог + обе транскрибации
 - `result.json` — метаданные (тайминги, модели, пути)
+
+## Batch CLI (пачка файлов)
+
+Если нужно обработать сразу много файлов:
+
+- по-отдельности:
+
+```bash
+source .venv/bin/activate
+python3 transcribe_batch_cli.py \
+  --mode separate \
+  --out ./batch_out \
+  --inputs ./a1.m4a ./a2.m4a ./a3.ogg
+```
+
+- объединить в одно аудио и обработать как одно сообщение:
+
+```bash
+source .venv/bin/activate
+python3 transcribe_batch_cli.py \
+  --mode merge \
+  --out ./batch_out_merged \
+  --inputs ./a1.m4a ./a2.m4a ./a3.ogg
+```
+
+В `--out` создаётся `summary.json` с общим статусом и путями к `transcript.md`/`result.json` по каждому job.
+
+## Swift macOS приложение
+
+Есть отдельный GUI-клиент на SwiftUI, который запускает тот же Python-пайплайн:
+
+```bash
+cd swift_app
+swift run
+```
+
+Что умеет:
+- выбрать один или несколько audio/video файлов
+- для пачки выбрать режим: `По отдельности` или `Объединить в одно`
+- запускать транскрибацию через `transcribe_batch_cli.py`
+- показывать лог и открывать итоговые `transcript.md` и output-папки
+
+Важно:
+- приложение ожидает, что в корне проекта есть `.venv` с зависимостями (или системный `python3` с установленными requirements)
+- `ffmpeg` должен быть доступен в `PATH`
 
 ### Работа в групповом чате
 

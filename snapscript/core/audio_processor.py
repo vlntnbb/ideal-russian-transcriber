@@ -124,7 +124,7 @@ class TranscriptionService:
     def __init__(
         self,
         *,
-        model_size: str = "medium",
+        model_size: str = "large-v3-turbo",
         device: str = "cpu",
         language: str = "ru",
         compute_type: Optional[str] = None,
@@ -169,7 +169,7 @@ class TranscriptionService:
         model = self._load_model(self.model_size, self.device, self.compute_type, self.cpu_threads)
         vad_filter_env = (os.environ.get("WHISPER_VAD_FILTER") or "").strip().lower()
         vad_filter = vad_filter_env in {"1", "true", "yes", "y", "on"}
-        # Speed/quality knobs (on CPU medium defaults are slow: beam_size=5).
+        # Speed/quality knobs (beam_size=5 can be slow on CPU).
         try:
             beam_size = int((os.environ.get("WHISPER_BEAM_SIZE") or "").strip() or "1")
         except Exception:

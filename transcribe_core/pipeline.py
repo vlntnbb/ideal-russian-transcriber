@@ -134,7 +134,7 @@ def run_transcription_job(
     models: dict[str, object] = {}
     errors: dict[str, Optional[str]] = {"whisper": None, "gigaam": None, "llm": None}
 
-    whisper_model = str_env("WHISPER_MODEL", "medium")
+    whisper_model = str_env("WHISPER_MODEL", "large-v3-turbo")
     gigaam_model = str_env("GIGAAM_MODEL", "v3_e2e_rnnt")
     device = str_env("DEVICE", "cpu")
     language = str_env("LANGUAGE", "ru")
